@@ -1,0 +1,21 @@
+[package]
+name = "dragon-browser"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, content-first browser prototype"
+license = "MIT"
+
+[lib]
+name = "dragon_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dragon-browser"
+path = "src/main.rs"
+
+[dependencies]
+boa_engine = "0.22"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+thiserror = "2"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
