@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "A lightweight, content-first browser prototype"
 license = "MIT"
+authors = ["Dragon Browser contributors"]
+
+[package.metadata.deb]
+maintainer = "Dragon Browser contributors <dragon-browser@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
 
 [lib]
 name = "dragon_core"
