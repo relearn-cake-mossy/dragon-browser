@@ -1,3 +1,6 @@
+mod css;
+pub use css::{StyledBlock, TextStyle};
+
 use std::io::Read;
 use std::time::Duration;
 
@@ -11,10 +14,11 @@ const OMITTED_ELEMENTS: &[&str] = &[
     "aside", "button", "footer", "form", "iframe", "nav", "noscript", "script", "style", "svg",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Article {
     pub title: String,
     pub text: String,
+    pub blocks: Vec<StyledBlock>,
 }
 
 #[derive(Debug, Error)]
@@ -57,6 +61,7 @@ pub fn parse_html(html: &str) -> Article {
         .or_else(|| find_text_in_tag(&dom.document, "h1"))
         .unwrap_or_default();
 
+    let mut content_root = None;
     let mut article_text = String::new();
     let mut pending = vec![dom.document.clone()];
     while let Some(node) = pending.pop() {
@@ -65,19 +70,34 @@ pub fn parse_html(html: &str) -> Article {
                 let text = collect_text(&node);
                 if text.len() > article_text.len() {
                     article_text = text;
+                    content_root = Some(node.clone());
                 }
             }
         }
         pending.extend(node.children.borrow().iter().cloned());
     }
 
+    let root = content_root.unwrap_or_else(|| dom.document.clone());
     let text = if article_text.is_empty() {
-        collect_text(&dom.document)
+        collect_text(&root)
     } else {
         article_text
     };
+    let stylesheets = css::embedded_stylesheets(&dom.document);
+    let mut blocks = css::styled_blocks(&root, &stylesheets);
+    if blocks.is_empty() && !text.is_empty() {
+        blocks.push(StyledBlock {
+            text: text.clone(),
+            heading_level: None,
+            style: TextStyle::default(),
+        });
+    }
 
-    Article { title, text }
+    Article {
+        title,
+        text,
+        blocks,
+    }
 }
 
 /// Executes JavaScript in an isolated ECMAScript context and returns its result.
@@ -174,6 +194,20 @@ mod tests {
 
         assert_eq!(article.title, "Tiêu đề");
         assert_eq!(article.text, "Tiêu đề Đoạn văn");
+    }
+
+    #[test]
+    fn applies_embedded_css_to_article_blocks() {
+        let article = parse_html(
+            "<style>.lead { color: #123; font-size: 15px; font-weight: bold }</style>\
+             <main><p class='lead'>Nội dung tin</p></main>",
+        );
+
+        assert_eq!(article.blocks.len(), 1);
+        assert_eq!(article.blocks[0].text, "Nội dung tin");
+        assert_eq!(article.blocks[0].style.color, Some([17, 34, 51]));
+        assert_eq!(article.blocks[0].style.font_size, Some(15.0));
+        assert_eq!(article.blocks[0].style.bold, Some(true));
     }
 
     #[test]
