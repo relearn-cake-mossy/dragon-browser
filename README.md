@@ -11,15 +11,21 @@ cargo run --release
 cargo run --release -- https://vnexpress.net
 ```
 
-Ứng dụng mở cửa sổ desktop có thanh địa chỉ và tải nội dung không chặn giao diện.
-Đây hiện là **chế độ đọc thử nghiệm**: Dragon trích xuất nội dung HTML và áp dụng
-một phần CSS cơ bản từ thẻ `<style>` hoặc thuộc tính `style`: màu chữ, cỡ chữ
-`px`, độ đậm, cùng bộ chọn thẻ/class/id đơn giản. CSS layout, selector phức tạp,
-stylesheet bên ngoài, JavaScript trên trang, ảnh và Web APIs chưa được hỗ trợ.
-Vì vậy VnExpress và các trang hiện đại vẫn chưa hiển thị đúng.
+Ứng dụng dựng phần thân HTML thành các khối nội dung, tải stylesheet ngoài và
+tối đa 8 ảnh (kể cả `data-src` phổ biến). Boa chạy một số script JavaScript
+inline; hỗ trợ `document.write/writeln` để thêm HTML đơn giản. Script ngoài,
+DOM/`window`/Web APIs và JavaScript phức tạp chưa được hỗ trợ. CSS còn giới hạn
+ở bộ chọn thẻ/class/id đơn giản và một số thuộc tính chữ/màu/ẩn; chưa có CSS
+layout, ảnh nền hay video. Đây **chưa phải trình duyệt tương thích đầy đủ** và
+VnExpress vẫn có thể hiển thị thiếu hoặc sai.
 
-Mỗi tài liệu bị giới hạn ở 8 MiB và các kết nối có timeout. Những giới hạn này
-giúp tránh tải trang không giới hạn, nhưng chưa phải cam kết mức RAM thực tế.
+Script inline được giới hạn số lượng, kích thước và số vòng lặp. Lỗi script
+được hiển thị ở phần đầu trang thay vì âm thầm bỏ qua.
+
+HTML giới hạn 8 MiB, stylesheet 512 KiB mỗi file (tối đa 8 file), ảnh 1 MiB mỗi
+file (tối đa 8 ảnh); mỗi ảnh còn giới hạn kích thước giải mã. Các kết nối có
+timeout. Đây là giới hạn bảo vệ cơ bản, không phải cam kết RAM cụ thể.
+
 Trên Linux, cần thư viện hệ thống cho đồ họa X11 hoặc Wayland.
 
 ## Build cho Windows

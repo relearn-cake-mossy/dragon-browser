@@ -26,3 +26,5 @@ html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 thiserror = "2"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+url = "2.5"

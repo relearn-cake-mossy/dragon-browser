@@ -1,13 +1,18 @@
+use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use dragon_core::Article;
+use dragon_core::{Article, TextAlignment};
 use eframe::egui;
+
+const MAX_IMAGE_PIXELS: u64 = 1_000_000;
 
 struct DragonBrowserApp {
     address: String,
     page: Option<Article>,
+    page_images: HashMap<String, egui::TextureHandle>,
     error: Option<String>,
     loading: bool,
     request_id: u64,
@@ -21,6 +26,7 @@ impl DragonBrowserApp {
         let mut app = Self {
             address: initial_url.unwrap_or_default(),
             page: None,
+            page_images: HashMap::new(),
             error: None,
             loading: false,
             request_id: 0,
@@ -41,6 +47,7 @@ impl DragonBrowserApp {
 
         self.address = address.clone();
         self.page = None;
+        self.page_images.clear();
         self.error = None;
         self.loading = true;
         self.request_id += 1;
@@ -53,14 +60,40 @@ impl DragonBrowserApp {
         });
     }
 
-    fn receive_page(&mut self) {
+    fn receive_page(&mut self, context: &egui::Context) {
         while let Ok((request_id, result)) = self.receiver.try_recv() {
             if request_id != self.request_id {
                 continue;
             }
             self.loading = false;
             match result {
-                Ok(article) => self.page = Some(article),
+                Ok(mut article) => {
+                    self.page_images.clear();
+                    for image in &article.images {
+                        match decode_page_image(&image.bytes) {
+                            Ok(decoded_image) => {
+                                let decoded_image = decoded_image.to_rgba8();
+                                let size = [
+                                    decoded_image.width() as usize,
+                                    decoded_image.height() as usize,
+                                ];
+                                let pixels = decoded_image.into_raw();
+                                let color_image =
+                                    egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                let texture = context.load_texture(
+                                    image.url.clone(),
+                                    color_image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.page_images.insert(image.url.clone(), texture);
+                            }
+                            Err(error) => article
+                                .resource_warnings
+                                .push(format!("Không hiển thị được ảnh {}: {error}", image.url)),
+                        }
+                    }
+                    self.page = Some(article);
+                }
                 Err(error) => self.error = Some(error),
             }
         }
@@ -69,7 +102,7 @@ impl DragonBrowserApp {
 
 impl eframe::App for DragonBrowserApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.receive_page();
+        self.receive_page(context);
         if self.loading {
             context.request_repaint_after(Duration::from_millis(100));
         }
@@ -100,7 +133,7 @@ impl eframe::App for DragonBrowserApp {
                 ui.label(if self.loading {
                     "Đang tải trang..."
                 } else {
-                    "Chế độ đọc thử nghiệm · chưa hỗ trợ JavaScript/DOM trên trang"
+                    "Dragon Core · HTML/CSS/JavaScript cơ bản; chưa tương thích đầy đủ"
                 });
             });
         });
@@ -114,11 +147,24 @@ impl eframe::App for DragonBrowserApp {
                         ui.heading("Không thể mở trang");
                         ui.label(error);
                     } else if let Some(article) = &self.page {
+                        for warning in &article.resource_warnings {
+                            ui.colored_label(egui::Color32::DARK_RED, warning);
+                        }
                         if !article.title.is_empty() {
                             ui.heading(&article.title);
                             ui.add_space(14.0);
                         }
                         for block in &article.blocks {
+                            if let Some(image_url) = &block.image_url {
+                                if let Some(texture) = self.page_images.get(image_url) {
+                                    ui.add(
+                                        egui::Image::new(texture).max_width(ui.available_width()),
+                                    );
+                                } else if !block.image_alt.is_empty() {
+                                    ui.label(&block.image_alt);
+                                }
+                                continue;
+                            }
                             if block.heading_level.is_some() && block.text == article.title {
                                 continue;
                             }
@@ -132,13 +178,42 @@ impl eframe::App for DragonBrowserApp {
                             let mut text = egui::RichText::new(&block.text)
                                 .size(block.style.font_size.unwrap_or(default_size))
                                 .line_height(Some(26.0));
-                            if block.style.bold.unwrap_or(block.heading_level.is_some()) {
+                            if block.style.bold.unwrap_or(block.heading_level.is_some())
+                                || block.heading_level.is_some()
+                            {
                                 text = text.strong();
                             }
                             if let Some([red, green, blue]) = block.style.color {
                                 text = text.color(egui::Color32::from_rgb(red, green, blue));
                             }
-                            ui.add(egui::Label::new(text).wrap());
+                            let add_text = |ui: &mut egui::Ui| {
+                                let text = egui::Label::new(text.clone()).wrap();
+                                if let Some([red, green, blue]) = block.style.background_color {
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgb(red, green, blue))
+                                        .inner_margin(egui::Margin::symmetric(8, 4))
+                                        .show(ui, |ui| {
+                                            ui.add(text);
+                                        });
+                                } else {
+                                    ui.add(text);
+                                }
+                            };
+                            match block.style.text_align {
+                                Some(TextAlignment::Center) => {
+                                    ui.with_layout(
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        add_text,
+                                    );
+                                }
+                                Some(TextAlignment::Right) => {
+                                    ui.with_layout(
+                                        egui::Layout::top_down(egui::Align::RIGHT),
+                                        add_text,
+                                    );
+                                }
+                                _ => add_text(ui),
+                            }
                             ui.add_space(if block.heading_level.is_some() {
                                 12.0
                             } else {
@@ -161,6 +236,19 @@ impl eframe::App for DragonBrowserApp {
                 });
         });
     }
+}
+
+fn decode_page_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| error.to_string())?;
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS || width > 4096 || height > 4096 {
+        return Err("kích thước ảnh vượt giới hạn giải mã".into());
+    }
+    image::load_from_memory(bytes).map_err(|error| error.to_string())
 }
 
 fn normalize_address(address: &str) -> String {
