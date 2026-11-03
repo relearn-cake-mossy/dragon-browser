@@ -8,8 +8,21 @@ pub struct TextStyle {
     pub bold: Option<bool>,
     pub italic: bool,
     pub underline: bool,
+    pub display: Option<DisplayMode>,
+    pub width: Option<f32>,
+    pub max_width: Option<f32>,
+    pub margin: [f32; 4],
+    pub padding: [f32; 4],
     pub text_align: Option<TextAlignment>,
     pub hidden: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    Block,
+    Inline,
+    InlineBlock,
+    Flex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +46,7 @@ pub struct StyledBlock {
 pub struct RenderNode {
     pub tag: Option<String>,
     pub text: String,
+    pub href: Option<String>,
     pub style: TextStyle,
     pub image_url: Option<String>,
     pub image_alt: String,
@@ -170,6 +184,7 @@ fn build_render_node(
         NodeData::Text { contents } => RenderNode {
             tag: None,
             text: contents.borrow().to_string(),
+            href: None,
             style: inherited.clone(),
             image_url: None,
             image_alt: String::new(),
@@ -192,6 +207,7 @@ fn build_render_node(
             RenderNode {
                 tag: (!hidden).then(|| tag.to_owned()),
                 text: String::new(),
+                href: (tag == "a").then(|| attribute(node, "href")).flatten(),
                 style,
                 image_url: (tag == "img")
                     .then(|| image_source(node, base_url))
@@ -203,6 +219,7 @@ fn build_render_node(
         _ => RenderNode {
             tag: None,
             text: String::new(),
+            href: None,
             style: inherited.clone(),
             image_url: None,
             image_alt: String::new(),
@@ -399,7 +416,28 @@ fn parse_declarations(declarations: &str) -> TextStyle {
                     _ => None,
                 };
             }
-            "display" => style.hidden = value == "none",
+            "display" => {
+                style.hidden = value == "none";
+                style.display = match value.as_str() {
+                    "block" | "list-item" | "table" => Some(DisplayMode::Block),
+                    "inline" => Some(DisplayMode::Inline),
+                    "inline-block" => Some(DisplayMode::InlineBlock),
+                    "flex" | "inline-flex" => Some(DisplayMode::Flex),
+                    _ => None,
+                };
+            }
+            "width" => style.width = parse_layout_length(&value),
+            "max-width" => style.max_width = parse_layout_length(&value),
+            "margin" => style.margin = parse_box_values(&value).unwrap_or(style.margin),
+            "padding" => style.padding = parse_box_values(&value).unwrap_or(style.padding),
+            "margin-top" => style.margin[0] = parse_layout_length(&value).unwrap_or(0.0),
+            "margin-right" => style.margin[1] = parse_layout_length(&value).unwrap_or(0.0),
+            "margin-bottom" => style.margin[2] = parse_layout_length(&value).unwrap_or(0.0),
+            "margin-left" => style.margin[3] = parse_layout_length(&value).unwrap_or(0.0),
+            "padding-top" => style.padding[0] = parse_layout_length(&value).unwrap_or(0.0),
+            "padding-right" => style.padding[1] = parse_layout_length(&value).unwrap_or(0.0),
+            "padding-bottom" => style.padding[2] = parse_layout_length(&value).unwrap_or(0.0),
+            "padding-left" => style.padding[3] = parse_layout_length(&value).unwrap_or(0.0),
             "font-weight" => {
                 style.bold = Some(
                     value == "bold"
@@ -419,9 +457,42 @@ fn parse_declarations(declarations: &str) -> TextStyle {
     style
 }
 
+fn parse_layout_length(value: &str) -> Option<f32> {
+    if let Some(percent) = value.strip_suffix('%') {
+        let percent = percent.trim().parse::<f32>().ok()?;
+        return (percent.is_finite() && percent >= 0.0).then_some(-percent);
+    }
+    let value = value
+        .strip_suffix("px")
+        .unwrap_or(value)
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+fn parse_box_values(value: &str) -> Option<[f32; 4]> {
+    let values = value
+        .split_ascii_whitespace()
+        .map(parse_layout_length)
+        .collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
+        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
+        _ => None,
+    }
+}
+
 fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextStyle {
     let mut style = inherited.clone();
     style.background_color = None;
+    style.display = None;
+    style.width = None;
+    style.max_width = None;
+    style.margin = [0.0; 4];
+    style.padding = [0.0; 4];
     for property in [
         "color",
         "background-color",
@@ -429,8 +500,12 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
         "font-weight",
         "font-style",
         "text-decoration",
-        "text-align",
         "display",
+        "width",
+        "max-width",
+        "margin",
+        "padding",
+        "text-align",
     ] {
         let winner = rules
             .iter()
@@ -442,8 +517,13 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
                 "font-weight" => rule.style.bold.is_some(),
                 "font-style" => rule.style.italic,
                 "text-decoration" => rule.style.underline,
+                "display" => rule.style.display.is_some() || rule.style.hidden,
+                "width" => rule.style.width.is_some(),
+                "max-width" => rule.style.max_width.is_some(),
+                "margin" => rule.style.margin != [0.0; 4],
+                "padding" => rule.style.padding != [0.0; 4],
                 "text-align" => rule.style.text_align.is_some(),
-                _ => rule.style.hidden,
+                _ => false,
             })
             .max_by_key(|rule| (rule.specificity, rule.order));
         if let Some(rule) = winner {
@@ -454,8 +534,16 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
                 "font-weight" => style.bold = rule.style.bold,
                 "font-style" => style.italic = rule.style.italic,
                 "text-decoration" => style.underline = rule.style.underline,
+                "display" => {
+                    style.display = rule.style.display;
+                    style.hidden = rule.style.hidden;
+                }
+                "width" => style.width = rule.style.width,
+                "max-width" => style.max_width = rule.style.max_width,
+                "margin" => style.margin = rule.style.margin,
+                "padding" => style.padding = rule.style.padding,
                 "text-align" => style.text_align = rule.style.text_align,
-                _ => style.hidden = rule.style.hidden,
+                _ => {}
             }
         }
     }
@@ -476,6 +564,22 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
         }
         style.italic |= inline.italic;
         style.underline |= inline.underline;
+        if inline.display.is_some() || inline.hidden {
+            style.display = inline.display;
+            style.hidden = inline.hidden;
+        }
+        if inline.width.is_some() {
+            style.width = inline.width;
+        }
+        if inline.max_width.is_some() {
+            style.max_width = inline.max_width;
+        }
+        if inline.margin != [0.0; 4] {
+            style.margin = inline.margin;
+        }
+        if inline.padding != [0.0; 4] {
+            style.padding = inline.padding;
+        }
         if inline.text_align.is_some() {
             style.text_align = inline.text_align;
         }
@@ -485,10 +589,55 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
 }
 
 fn apply_element_defaults(tag: &str, style: &mut TextStyle) {
+    if style.display.is_none() && is_block_tag(tag) {
+        style.display = Some(DisplayMode::Block);
+    }
     if style.bold.is_none()
         && (heading_level(tag).is_some() || matches!(tag, "b" | "strong" | "th"))
     {
         style.bold = Some(true);
+    }
+
+    fn is_block_tag(tag: &str) -> bool {
+        matches!(
+            tag,
+            "address"
+                | "article"
+                | "aside"
+                | "blockquote"
+                | "body"
+                | "dd"
+                | "details"
+                | "div"
+                | "dl"
+                | "dt"
+                | "fieldset"
+                | "figcaption"
+                | "figure"
+                | "footer"
+                | "form"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "header"
+                | "hr"
+                | "li"
+                | "main"
+                | "nav"
+                | "ol"
+                | "p"
+                | "pre"
+                | "section"
+                | "table"
+                | "tbody"
+                | "tfoot"
+                | "thead"
+                | "tr"
+                | "ul"
+        )
     }
     if style.font_size.is_none() {
         style.font_size = match heading_level(tag) {
@@ -511,11 +660,67 @@ fn apply_element_defaults(tag: &str, style: &mut TextStyle) {
 fn selector_matches(selector: &str, node: &Handle) -> bool {
     let selector = selector.trim();
     if selector.is_empty()
-        || selector.contains([' ', '>', '+', '~', ':', '[', ']'])
+        || selector.contains(['+', '~', ':', '[', ']'])
         || selector.starts_with('@')
     {
         return false;
     }
+
+    let tokens = selector
+        .replace('>', " > ")
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut current = Some(node.clone());
+    let mut index = tokens.len();
+    if !current
+        .as_ref()
+        .is_some_and(|node| simple_selector_matches(&tokens[index - 1], node))
+    {
+        return false;
+    }
+    index -= 1;
+    while index > 0 {
+        let direct_parent = tokens[index - 1] == ">";
+        if direct_parent {
+            index -= 1;
+        }
+        let mut parent = current.as_ref().and_then(parent_node);
+        if direct_parent {
+            if !parent
+                .as_ref()
+                .is_some_and(|node| simple_selector_matches(&tokens[index - 1], node))
+            {
+                return false;
+            }
+        } else {
+            while parent
+                .as_ref()
+                .is_some_and(|node| !simple_selector_matches(&tokens[index - 1], node))
+            {
+                parent = parent.as_ref().and_then(parent_node);
+            }
+            if parent.is_none() {
+                return false;
+            }
+        }
+        current = parent;
+        index -= 1;
+    }
+    true
+}
+
+fn parent_node(node: &Handle) -> Option<Handle> {
+    let parent = node.parent.take();
+    let upgraded = parent.as_ref().and_then(|parent| parent.upgrade());
+    node.parent.set(parent);
+    upgraded
+}
+
+fn simple_selector_matches(selector: &str, node: &Handle) -> bool {
     let Some(tag) = element_name(node) else {
         return false;
     };
@@ -690,7 +895,26 @@ mod tests {
     use html5ever::{parse_document, tendril::TendrilSink};
     use markup5ever_rcdom::RcDom;
 
-    use super::{styled_blocks, TextAlignment};
+    use super::{render_tree, styled_blocks, DisplayMode, TextAlignment};
+
+    fn find<'a>(node: &'a super::RenderNode, tag: &str) -> &'a super::RenderNode {
+        if node.tag.as_deref() == Some(tag) {
+            return node;
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_optional(child, tag))
+            .expect("expected render element")
+    }
+
+    fn find_optional<'a>(node: &'a super::RenderNode, tag: &str) -> Option<&'a super::RenderNode> {
+        if node.tag.as_deref() == Some(tag) {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_optional(child, tag))
+    }
 
     #[test]
     fn applies_embedded_css_by_specificity_and_inherits_text_styles() {
@@ -742,5 +966,31 @@ mod tests {
         let blocks = styled_blocks(&dom.document, &[stylesheet.into()], None);
 
         assert_eq!(blocks[0].style.color, Some([10, 20, 30]));
+    }
+
+    #[test]
+    fn applies_descendant_and_child_rules_and_box_layout() {
+        let stylesheet =
+            "main .card > p { width: 80%; margin: 4px 8px; padding: 6px; display: block }";
+        let html =
+            format!("<style>{stylesheet}</style><main><div class='card'><p>Text</p></div></main>");
+        let dom = parse_document(RcDom::default(), Default::default()).one(html);
+        let tree = render_tree(&dom.document, &[stylesheet.into()], None);
+        let paragraph = find(&tree, "p");
+
+        assert_eq!(paragraph.style.display, Some(DisplayMode::Block));
+        assert_eq!(paragraph.style.width, Some(-80.0));
+        assert_eq!(paragraph.style.margin, [4.0, 8.0, 4.0, 8.0]);
+        assert_eq!(paragraph.style.padding, [6.0; 4]);
+    }
+
+    #[test]
+    fn display_flex_is_kept_in_render_tree() {
+        let stylesheet = ".row { display: flex }";
+        let html = format!("<style>{stylesheet}</style><div class='row'><span>x</span></div>");
+        let dom = parse_document(RcDom::default(), Default::default()).one(html);
+        let tree = render_tree(&dom.document, &[stylesheet.into()], None);
+
+        assert_eq!(find(&tree, "div").style.display, Some(DisplayMode::Flex));
     }
 }

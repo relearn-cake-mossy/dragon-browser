@@ -1,5 +1,5 @@
 mod css;
-pub use css::{RenderNode, StyledBlock, TextAlignment, TextStyle};
+pub use css::{DisplayMode, RenderNode, StyledBlock, TextAlignment, TextStyle};
 
 use std::io::Read;
 use std::time::Duration;
@@ -319,8 +319,7 @@ fn execute_scripts(
     }
 
     let dom = parse_document(RcDom::default(), Default::default()).one(html);
-    let body = find_element(&dom.document, "body").unwrap_or_else(|| dom.document.clone());
-    let dom_model = dom_model_source(&body);
+    let dom_model = dom_model_source(&dom.document);
     let location = location_model(page_url);
     let platform = js_string(std::env::consts::OS);
     let mut context = Context::default();
@@ -359,8 +358,12 @@ fn execute_scripts(
                 model[2].forEach(function(pair) {{ node._attributes[pair[0]] = pair[1]; }});
                 model[3].forEach(function(child) {{ node.childNodes.push(__dragonCreate(child, node)); }});
             }} else {{
-                node = {{ nodeType: model[0] === "c" ? 8 : 3, nodeName: model[0] === "c" ? "#comment" : "#text",
+                node = {{ nodeType: model[0] === "c" ? 8 : (model[0] === "f" ? 9 : 3),
+                    nodeName: model[0] === "c" ? "#comment" : (model[0] === "f" ? "#document" : "#text"),
                     nodeValue: model[1], parentNode: parent || null, childNodes: [], _attributes: Object.create(null) }};
+                if (model[0] === "f") model[3].forEach(function(child) {{
+                    node.childNodes.push(__dragonCreate(child, node));
+                }});
             }}
             Object.defineProperty(node, "textContent", {{
                 get: function() {{
@@ -396,6 +399,123 @@ fn execute_scripts(
             node.addEventListener = function() {{}};
             node.removeEventListener = function() {{}};
             node.dispatchEvent = function() {{ return true; }};
+            Object.defineProperty(node, "id", {{
+                get: function() {{ return this.getAttribute("id") || ""; }},
+                set: function(value) {{ this.setAttribute("id", value); }}
+            }});
+            Object.defineProperty(node, "className", {{
+                get: function() {{ return this.getAttribute("class") || ""; }},
+                set: function(value) {{ this.setAttribute("class", value); }}
+            }});
+            Object.defineProperty(node, "parentElement", {{
+                get: function() {{ return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null; }}
+            }});
+            Object.defineProperty(node, "children", {{
+                get: function() {{ return this.childNodes.filter(function(child) {{ return child.nodeType === 1; }}); }}
+            }});
+            Object.defineProperty(node, "firstChild", {{
+                get: function() {{ return this.childNodes.length ? this.childNodes[0] : null; }}
+            }});
+            Object.defineProperty(node, "lastChild", {{
+                get: function() {{ return this.childNodes.length ? this.childNodes[this.childNodes.length - 1] : null; }}
+            }});
+            Object.defineProperty(node, "firstElementChild", {{
+                get: function() {{ return this.children[0] || null; }}
+            }});
+            Object.defineProperty(node, "childElementCount", {{
+                get: function() {{ return this.children.length; }}
+            }});
+            Object.defineProperty(node, "style", {{
+                get: function() {{
+                    var element = this;
+                    var result = {{
+                        getPropertyValue: function(name) {{
+                            var declarations = (element.getAttribute("style") || "").split(";");
+                            name = String(name).toLowerCase();
+                            for (var i = 0; i < declarations.length; i++) {{
+                                var pair = declarations[i].split(":");
+                                if (pair.length > 1 && pair[0].trim().toLowerCase() === name) return pair.slice(1).join(":").trim();
+                            }}
+                            return "";
+                        }},
+                        setProperty: function(name, value) {{
+                            var declarations = Object.create(null);
+                            (element.getAttribute("style") || "").split(";").forEach(function(declaration) {{
+                                var pair = declaration.split(":");
+                                if (pair.length > 1) declarations[pair[0].trim().toLowerCase()] = pair.slice(1).join(":").trim();
+                            }});
+                            declarations[String(name).toLowerCase()] = String(value);
+                            element.setAttribute("style", Object.keys(declarations).map(function(key) {{ return key + ": " + declarations[key]; }}).join("; "));
+                        }},
+                        removeProperty: function(name) {{
+                            var current = this.getPropertyValue(name);
+                            if (current) {{
+                                var nameLower = String(name).toLowerCase();
+                                var remaining = (element.getAttribute("style") || "").split(";").filter(function(declaration) {{
+                                    return declaration.split(":")[0].trim().toLowerCase() !== nameLower;
+                                }});
+                                element.setAttribute("style", remaining.join(";"));
+                            }}
+                            return current;
+                        }}
+                    }};
+                    ["display", "width", "height", "color", "backgroundColor", "fontSize", "fontWeight",
+                     "textAlign", "margin", "marginTop", "marginRight", "marginBottom", "marginLeft",
+                     "padding", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft"].forEach(function(property) {{
+                        var cssName = property.replace(/[A-Z]/g, function(letter) {{ return "-" + letter.toLowerCase(); }});
+                        Object.defineProperty(result, property, {{
+                            get: function() {{ return result.getPropertyValue(cssName); }},
+                            set: function(value) {{ result.setProperty(cssName, value); }}
+                        }});
+                    }});
+                    return result;
+                }}
+            }});
+            node.contains = function(other) {{
+                while (other) {{
+                    if (other === this) return true;
+                    other = other.parentNode;
+                }}
+                return false;
+            }};
+            node.cloneNode = function(deep) {{
+                if (this.nodeType === 3) return document.createTextNode(this.nodeValue);
+                if (this.nodeType === 8) return document.createComment(this.nodeValue);
+                var attributes = Object.keys(this._attributes).map(function(key) {{
+                    return [key, this._attributes[key]];
+                }}, this);
+                var copy = __dragonCreate(["e", this.tagName.toLowerCase(), attributes, []], null);
+                if (deep) this.childNodes.forEach(function(child) {{ copy.appendChild(child.cloneNode(true)); }});
+                return copy;
+            }};
+            node.matches = function(selector) {{ return __dragonMatches(this, selector); }};
+            node.closest = function(selector) {{
+                var current = this;
+                while (current && current.nodeType === 1) {{
+                    if (__dragonMatches(current, selector)) return current;
+                    current = current.parentNode;
+                }}
+                return null;
+            }};
+            node.classList = {{
+                contains: function(name) {{ return (" " + node.className.replace(/\s+/g, " ") + " ").indexOf(" " + name + " ") >= 0; }},
+                add: function() {{
+                    var names = node.className.split(/\s+/).filter(Boolean);
+                    Array.prototype.forEach.call(arguments, function(name) {{ if (names.indexOf(name) < 0) names.push(name); }});
+                    node.className = names.join(" ");
+                }},
+                remove: function() {{
+                    var names = node.className.split(/\s+/).filter(Boolean);
+                    Array.prototype.forEach.call(arguments, function(name) {{ names = names.filter(function(item) {{ return item !== name; }}); }});
+                    node.className = names.join(" ");
+                }},
+                toggle: function(name, force) {{
+                    var present = this.contains(name);
+                    var add = force === undefined ? !present : !!force;
+                    if (add) this.add(name); else this.remove(name);
+                    return add;
+                }}
+            }};
             node.appendChild = function(child) {{
                 if (child.parentNode) child.parentNode.removeChild(child);
                 child.parentNode = this;
@@ -423,23 +543,43 @@ fn execute_scripts(
             return node;
         }}
         function __dragonMatches(node, selector) {{
-            selector = String(selector).trim();
-            if (!selector || selector.indexOf(" ") >= 0 || selector.indexOf(">") >= 0 ||
-                selector.indexOf("+") >= 0 || selector.indexOf("~") >= 0 ||
-                selector.indexOf(":") >= 0 || selector.indexOf("[") >= 0 ||
-                selector.indexOf(",") >= 0 || node.nodeType !== 1) return false;
-            var id = selector.match(/#([\w-]+)/);
-            if (id) {{
-                if (node.getAttribute("id") !== id[1]) return false;
-                selector = selector.replace(id[0], "");
+            function simpleMatch(element, part) {{
+                if (!element || element.nodeType !== 1 || !part ||
+                    part.indexOf(":") >= 0 || part.indexOf("[") >= 0 || part.indexOf("]") >= 0) return false;
+                var id = part.match(/#([\w-]+)/);
+                if (id) {{
+                    if (element.getAttribute("id") !== id[1]) return false;
+                    part = part.replace(id[0], "");
+                }}
+                var classes = part.match(/\.([\w-]+)/g) || [];
+                for (var i = 0; i < classes.length; i++) {{
+                    var name = classes[i].slice(1);
+                    if ((" " + (element.getAttribute("class") || "").replace(/\s+/g, " ") + " ").indexOf(" " + name + " ") < 0) return false;
+                }}
+                part = part.replace(/\.([\w-]+)/g, "");
+                return part === "" || part === "*" || element.tagName.toLowerCase() === part.toLowerCase();
             }}
-            var classes = selector.match(/\.([\w-]+)/g) || [];
-            for (var i = 0; i < classes.length; i++) {{
-                var name = classes[i].slice(1);
-                if ((" " + (node.getAttribute("class") || "").replace(/\s+/g, " ") + " ").indexOf(" " + name + " ") < 0) return false;
+            var groups = String(selector).split(",");
+            for (var g = 0; g < groups.length; g++) {{
+                var parts = groups[g].replace(/>/g, " > ").trim().split(/\s+/);
+                if (!parts.length || !simpleMatch(node, parts[parts.length - 1])) continue;
+                var current = node, i = parts.length - 1, matched = true;
+                while (i > 0) {{
+                    var direct = parts[i - 1] === ">";
+                    if (direct) i--;
+                    current = current.parentElement;
+                    if (direct) {{
+                        if (!simpleMatch(current, parts[i - 1])) matched = false;
+                    }} else {{
+                        while (current && !simpleMatch(current, parts[i - 1])) current = current.parentElement;
+                        if (!current) matched = false;
+                    }}
+                    if (!matched) break;
+                    i--;
+                }}
+                if (matched) return true;
             }}
-            selector = selector.replace(/\.([\w-]+)/g, "");
-            return selector === "" || selector === "*" || node.tagName.toLowerCase() === selector.toLowerCase();
+            return false;
         }}
         function __dragonQuery(root, selector, firstOnly) {{
             var found = [], pending = root.childNodes.slice().reverse();
@@ -454,6 +594,9 @@ fn execute_scripts(
             return found;
         }}
         var document = {{
+            _root: null,
+            documentElement: null,
+            head: null,
             body: null,
             URL: globalThis.__dragonLocation.href,
             documentURI: globalThis.__dragonLocation.href,
@@ -463,23 +606,27 @@ fn execute_scripts(
             writeln: function() {{ globalThis.__dragonWrites.push(Array.prototype.join.call(arguments, "") + "\n"); }},
             createElement: function(tag) {{ return __dragonCreate(["e", String(tag).toLowerCase(), [], []], null); }},
             createTextNode: function(text) {{ return __dragonCreate(["t", String(text)], null); }},
+            createComment: function(text) {{ return __dragonCreate(["c", String(text)], null); }},
             getElementById: function(id) {{ return this.querySelector("#" + String(id)); }},
             querySelector: function(selector) {{
-                if (__dragonMatches(this.body, selector)) return this.body;
-                return this.body.querySelector(selector);
+                if (__dragonMatches(this._root, selector)) return this._root;
+                return this._root.querySelector(selector);
             }},
             querySelectorAll: function(selector) {{
-                var found = this.body.querySelectorAll(selector);
-                if (__dragonMatches(this.body, selector)) found.unshift(this.body);
+                var found = this._root.querySelectorAll(selector);
+                if (__dragonMatches(this._root, selector)) found.unshift(this._root);
                 return found;
             }},
             getElementsByTagName: function(tag) {{ return this.querySelectorAll(String(tag)); }},
-            getElementsByClassName: function(name) {{ return this.querySelectorAll("." + String(name).trim().replace(/\\s+/g, ".")); }},
+            getElementsByClassName: function(name) {{ return this.querySelectorAll("." + String(name).trim().replace(/\s+/g, ".")); }},
             addEventListener: function() {{}},
             removeEventListener: function() {{}},
             dispatchEvent: function() {{ return true; }}
         }};
-        document.body = __dragonCreate(globalThis.__dragonRoot, null);
+        document._root = __dragonCreate(globalThis.__dragonRoot, null);
+        document.documentElement = document.querySelector("html");
+        document.head = document.querySelector("head");
+        document.body = document.querySelector("body");
         globalThis.document = document;
         globalThis.window = globalThis;
         globalThis.self = globalThis;
@@ -886,6 +1033,15 @@ mod tests {
     }
 
     #[test]
+    fn render_tree_keeps_anchor_href() {
+        let article = parse_html("<body><p><a href='../story'>Read more</a></p></body>");
+        let anchor = &article.render_tree.children[0].children[0];
+
+        assert_eq!(anchor.tag.as_deref(), Some("a"));
+        assert_eq!(anchor.href.as_deref(), Some("../story"));
+    }
+
+    #[test]
     fn executes_javascript_and_returns_the_result() {
         assert_eq!(
             execute_javascript("const title = 'Dragon'; title + ' Core'").unwrap(),
@@ -1092,6 +1248,40 @@ mod tests {
 
         assert!(warnings.is_empty());
         assert!(html.contains("vi-VN /"));
+    }
+
+    #[test]
+    fn supports_descendant_queries_and_class_list_mutation() {
+        let mut warnings = Vec::new();
+        let html = execute_inline_scripts(
+            "<body><main><p class='story'>Before</p></main>\
+             <script>\
+             var item = document.querySelector('main > p.story');\
+             item.classList.add('selected');\
+             item.textContent = item.className;\
+             </script></body>",
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(parse_html(&html).text.contains("story selected"));
+    }
+
+    #[test]
+    fn exposes_document_head_and_element_style_mutation() {
+        let mut warnings = Vec::new();
+        let html = execute_inline_scripts(
+            "<html><head><title>Test</title></head><body>\
+             <p id='hide'>Visible</p><script>\
+             if (!document.head || !document.documentElement || !document.body) throw new Error('document tree missing');\
+             document.getElementById('hide').style.display = 'none';\
+             </script></body></html>",
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(html.contains("style=\"display: none\""));
+        assert!(parse_html(&html).render_tree.children[0].style.hidden);
     }
 
     #[test]

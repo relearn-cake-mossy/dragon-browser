@@ -11,6 +11,11 @@ cargo run --release
 cargo run --release -- https://vnexpress.net
 ```
 
+Thanh tab phía trên cho phép mở tab mới bằng `+`, chuyển tab bằng cách chọn
+tiêu đề, và đóng tab bằng `×`. Mỗi tab giữ địa chỉ, nội dung tải và lỗi riêng.
+Liên kết văn bản trong trang có thể bấm; URL tương đối được phân giải theo địa
+chỉ trang hiện tại và chỉ điều hướng đến HTTP/HTTPS.
+
 Binary headless tùy chọn để kiểm tra bộ parser/renderer thử nghiệm của Dragon
 (không mở cửa sổ):
 
@@ -19,20 +24,18 @@ Binary headless tùy chọn để kiểm tra bộ parser/renderer thử nghiệm
 cargo run --release --features headless --bin dragon-browser-headless -- https://vnexpress.net
 ```
 
-Renderer hỗ trợ luồng block/inline và một tập nhỏ kiểu chữ/màu CSS; chưa có
-layout CSS đầy đủ (flex/grid/position), bảng hoàn chỉnh, SVG hay video. Ứng dụng
-tải stylesheet ngoài và tối đa 8 ảnh (kể cả `data-src` phổ biến). Boa chạy tối đa 16 script JavaScript
-cổ điển inline/ngoài theo thứ tự tài liệu, tối đa 32 script; script ngoài tối
-đa 512 KiB mỗi file.
+Renderer hỗ trợ luồng block/inline, selector CSS tag/class/id và selector con/
+hậu duệ, màu/chữ, display cơ bản (block/inline/flex), width/max-width theo px/%
+và margin/padding px. Chưa có layout CSS đầy đủ (flex-wrap/grow, grid, position),
+bảng hoàn chỉnh, SVG hay video. Ứng dụng tải stylesheet ngoài và tối đa 8 ảnh
+(kể cả `data-src` phổ biến). Boa chạy tối đa 32 script JavaScript cổ điển inline/
+ngoài theo thứ tự tài liệu; script ngoài tối đa 512 KiB mỗi file.
 `document.write/writeln` có thể thêm HTML đơn giản. JavaScript có DOM giả lập ở
-mức cơ bản: truy vấn tag/id/class đơn giản, tạo/thêm/xóa node, `textContent` và
-`innerHTML`; `navigator`, `location`, `console`, timer và event listener là các
-shim đồng bộ/tối giản. DOM thật, event loop, phần lớn Web APIs, module, script
-bất đồng bộ và JavaScript tương tác phức tạp chưa được hỗ trợ. Đây là bước tương
-thích nhỏ, không phải Chromium 30.
-CSS còn giới hạn ở bộ chọn thẻ/class/id đơn giản và một số thuộc tính chữ/màu/ẩn;
-chưa có CSS layout, ảnh nền hay video. Đây **chưa phải Chromium 30 hoặc trình
-duyệt tương thích đầy đủ**; VnExpress hiện tại vẫn có thể hiển thị thiếu hoặc sai.
+mức cơ bản: selector descendant/child, `classList`, thuộc tính DOM, clone node,
+`textContent`/`innerHTML`, sửa inline `style`; `navigator`, `location`, `console`,
+timer và event listener vẫn là shim đồng bộ/tối giản. DOM chuẩn, event loop,
+phần lớn Web APIs, module và script bất đồng bộ chưa được hỗ trợ. Đây **chưa phải
+Chromium 30 hoặc trình duyệt tương thích đầy đủ**; trang phức tạp vẫn có thể lệch.
 
 Script được giới hạn số lượng, kích thước và số vòng lặp. Lỗi tải/chạy script
 được hiển thị ở phần đầu trang thay vì âm thầm bỏ qua.
