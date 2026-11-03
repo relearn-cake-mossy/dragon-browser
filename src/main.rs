@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use dragon_core::{Article, TextAlignment};
+use dragon_core::{Article, RenderNode, TextAlignment, TextStyle};
 use eframe::egui;
 
 const MAX_IMAGE_PIXELS: u64 = 1_000_000;
@@ -13,6 +13,8 @@ struct DragonBrowserApp {
     address: String,
     page: Option<Article>,
     page_images: HashMap<String, egui::TextureHandle>,
+    logo: Option<egui::TextureHandle>,
+    logo_load_attempted: bool,
     error: Option<String>,
     loading: bool,
     request_id: u64,
@@ -27,6 +29,8 @@ impl DragonBrowserApp {
             address: initial_url.unwrap_or_default(),
             page: None,
             page_images: HashMap::new(),
+            logo: None,
+            logo_load_attempted: false,
             error: None,
             loading: false,
             request_id: 0,
@@ -102,6 +106,19 @@ impl DragonBrowserApp {
 
 impl eframe::App for DragonBrowserApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.logo_load_attempted {
+            self.logo_load_attempted = true;
+            if let Ok(image) = image::load_from_memory(include_bytes!("../assets/logo.png")) {
+                let image = image.resize(64, 64, image::imageops::FilterType::Lanczos3);
+                let image = image.to_rgba8();
+                let size = [image.width() as usize, image.height() as usize];
+                self.logo = Some(context.load_texture(
+                    "dragon-logo",
+                    egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
         self.receive_page(context);
         if self.loading {
             context.request_repaint_after(Duration::from_millis(100));
@@ -109,6 +126,9 @@ impl eframe::App for DragonBrowserApp {
 
         egui::TopBottomPanel::top("browser_toolbar").show(context, |ui| {
             ui.horizontal(|ui| {
+                if let Some(logo) = &self.logo {
+                    ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(30.0, 30.0)));
+                }
                 ui.heading(
                     egui::RichText::new("Dragon").color(egui::Color32::from_rgb(194, 66, 54)),
                 );
@@ -128,12 +148,12 @@ impl eframe::App for DragonBrowserApp {
 
         egui::TopBottomPanel::bottom("status_bar").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Dragon Core");
+                ui.label("Dragon renderer tự viết");
                 ui.separator();
                 ui.label(if self.loading {
                     "Đang tải trang..."
                 } else {
-                    "Dragon Core · HTML/CSS/JavaScript cơ bản; chưa tương thích đầy đủ"
+                    "HTML/CSS/JavaScript hỗ trợ giới hạn"
                 });
             });
         });
@@ -150,76 +170,7 @@ impl eframe::App for DragonBrowserApp {
                         for warning in &article.resource_warnings {
                             ui.colored_label(egui::Color32::DARK_RED, warning);
                         }
-                        if !article.title.is_empty() {
-                            ui.heading(&article.title);
-                            ui.add_space(14.0);
-                        }
-                        for block in &article.blocks {
-                            if let Some(image_url) = &block.image_url {
-                                if let Some(texture) = self.page_images.get(image_url) {
-                                    ui.add(
-                                        egui::Image::new(texture).max_width(ui.available_width()),
-                                    );
-                                } else if !block.image_alt.is_empty() {
-                                    ui.label(&block.image_alt);
-                                }
-                                continue;
-                            }
-                            if block.heading_level.is_some() && block.text == article.title {
-                                continue;
-                            }
-                            let default_size = match block.heading_level {
-                                Some(1) => 26.0,
-                                Some(2) => 22.0,
-                                Some(3) => 19.0,
-                                Some(_) => 17.0,
-                                None => 17.0,
-                            };
-                            let mut text = egui::RichText::new(&block.text)
-                                .size(block.style.font_size.unwrap_or(default_size))
-                                .line_height(Some(26.0));
-                            if block.style.bold.unwrap_or(block.heading_level.is_some())
-                                || block.heading_level.is_some()
-                            {
-                                text = text.strong();
-                            }
-                            if let Some([red, green, blue]) = block.style.color {
-                                text = text.color(egui::Color32::from_rgb(red, green, blue));
-                            }
-                            let add_text = |ui: &mut egui::Ui| {
-                                let text = egui::Label::new(text.clone()).wrap();
-                                if let Some([red, green, blue]) = block.style.background_color {
-                                    egui::Frame::new()
-                                        .fill(egui::Color32::from_rgb(red, green, blue))
-                                        .inner_margin(egui::Margin::symmetric(8, 4))
-                                        .show(ui, |ui| {
-                                            ui.add(text);
-                                        });
-                                } else {
-                                    ui.add(text);
-                                }
-                            };
-                            match block.style.text_align {
-                                Some(TextAlignment::Center) => {
-                                    ui.with_layout(
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        add_text,
-                                    );
-                                }
-                                Some(TextAlignment::Right) => {
-                                    ui.with_layout(
-                                        egui::Layout::top_down(egui::Align::RIGHT),
-                                        add_text,
-                                    );
-                                }
-                                _ => add_text(ui),
-                            }
-                            ui.add_space(if block.heading_level.is_some() {
-                                12.0
-                            } else {
-                                8.0
-                            });
-                        }
+                        render_node(ui, &article.render_tree, &self.page_images);
                     } else if self.loading {
                         ui.spinner();
                         ui.label("Dragon đang tải nội dung...");
@@ -238,6 +189,236 @@ impl eframe::App for DragonBrowserApp {
     }
 }
 
+fn render_node(
+    ui: &mut egui::Ui,
+    node: &RenderNode,
+    images: &HashMap<String, egui::TextureHandle>,
+) {
+    if node.tag.is_none() {
+        render_inline(ui, node, images);
+        return;
+    }
+
+    let tag = node.tag.as_deref().unwrap_or_default();
+    if tag == "img" {
+        render_image(ui, node, images);
+        return;
+    }
+    if !is_block_element(tag) {
+        render_inline(ui, node, images);
+        return;
+    }
+
+    let spacing = match tag {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => 12.0,
+        "p" | "blockquote" | "pre" | "ul" | "ol" | "table" | "figure" => 10.0,
+        _ => 0.0,
+    };
+    if spacing > 0.0 {
+        ui.add_space(spacing);
+    }
+    let draw_contents = |ui: &mut egui::Ui| {
+        if tag == "li" {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("• ");
+                render_flow_children(ui, node, images);
+            });
+        } else {
+            render_flow_children(ui, node, images);
+        }
+    };
+    let draw_aligned = |ui: &mut egui::Ui| match node.style.text_align {
+        Some(TextAlignment::Center) => {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), draw_contents);
+        }
+        Some(TextAlignment::Right) => {
+            ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), draw_contents);
+        }
+        _ => draw_contents(ui),
+    };
+    if let Some([red, green, blue]) = node.style.background_color {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(red, green, blue))
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, draw_aligned);
+    } else {
+        draw_aligned(ui);
+    }
+    if spacing > 0.0 {
+        ui.add_space(spacing);
+    }
+}
+
+fn render_flow_children(
+    ui: &mut egui::Ui,
+    node: &RenderNode,
+    images: &HashMap<String, egui::TextureHandle>,
+) {
+    let mut index = 0;
+    while index < node.children.len() {
+        if is_block_node(&node.children[index]) {
+            render_node(ui, &node.children[index], images);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < node.children.len() && !is_block_node(&node.children[index]) {
+            index += 1;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for child in &node.children[start..index] {
+                render_inline(ui, child, images);
+            }
+        });
+    }
+}
+
+fn render_inline(
+    ui: &mut egui::Ui,
+    node: &RenderNode,
+    images: &HashMap<String, egui::TextureHandle>,
+) {
+    if node.image_url.is_some() {
+        render_image(ui, node, images);
+        return;
+    }
+    if node.tag.is_none() {
+        let text = collapse_whitespace(&node.text);
+        if !text.is_empty() {
+            ui.add(egui::Label::new(rich_text(&text, &node.style)).wrap());
+        }
+        return;
+    }
+
+    let tag = node.tag.as_deref().unwrap_or_default();
+    if matches!(tag, "br" | "hr") {
+        ui.end_row();
+        return;
+    }
+    if node.children.is_empty() {
+        if matches!(tag, "input" | "button" | "select" | "textarea") {
+            let value = node
+                .children
+                .iter()
+                .map(|child| child.text.as_str())
+                .collect::<String>();
+            ui.label(rich_text(&value, &node.style));
+        }
+        return;
+    }
+
+    if let Some([red, green, blue]) = node.style.background_color {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(red, green, blue))
+            .show(ui, |ui| {
+                render_inline_children(ui, node, images);
+            });
+    } else {
+        render_inline_children(ui, node, images);
+    }
+}
+
+fn render_inline_children(
+    ui: &mut egui::Ui,
+    node: &RenderNode,
+    images: &HashMap<String, egui::TextureHandle>,
+) {
+    for child in &node.children {
+        render_inline(ui, child, images);
+    }
+}
+
+fn render_image(
+    ui: &mut egui::Ui,
+    node: &RenderNode,
+    images: &HashMap<String, egui::TextureHandle>,
+) {
+    if let Some(image_url) = &node.image_url {
+        if let Some(texture) = images.get(image_url) {
+            ui.add(egui::Image::new(texture).max_width(ui.available_width()));
+        } else if !node.image_alt.is_empty() {
+            ui.label(&node.image_alt);
+        }
+    }
+}
+
+fn rich_text(text: &str, style: &TextStyle) -> egui::RichText {
+    let mut text = egui::RichText::new(text).size(style.font_size.unwrap_or(16.0));
+    if style.bold == Some(true) {
+        text = text.strong();
+    }
+    if style.italic {
+        text = text.italics();
+    }
+    if style.underline {
+        text = text.underline();
+    }
+    if let Some([red, green, blue]) = style.color {
+        text = text.color(egui::Color32::from_rgb(red, green, blue));
+    }
+    text
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !collapsed.is_empty() && text.starts_with(char::is_whitespace) {
+        collapsed.insert(0, ' ');
+    }
+    if !collapsed.is_empty() && text.ends_with(char::is_whitespace) {
+        collapsed.push(' ');
+    }
+    collapsed
+}
+
+fn is_block_node(node: &RenderNode) -> bool {
+    node.tag.as_deref().is_some_and(is_block_element)
+}
+
+fn is_block_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "caption"
+            | "dd"
+            | "details"
+            | "dialog"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "tbody"
+            | "tfoot"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
 fn decode_page_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -253,7 +434,7 @@ fn decode_page_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
 
 fn normalize_address(address: &str) -> String {
     let address = address.trim();
-    if address.is_empty() || address.starts_with("http://") || address.starts_with("https://") {
+    if address.is_empty() || address.contains("://") {
         address.to_owned()
     } else {
         format!("https://{address}")

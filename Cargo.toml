@@ -1,6 +1,6 @@
 [package]
 name = "dragon-browser"
-version = "0.1.0"
+version = "0.0.2"
 edition = "2021"
 description = "A lightweight, content-first browser prototype"
 license = "MIT"
@@ -18,6 +18,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "dragon-browser"
 path = "src/main.rs"
+
+[[bin]]
+name = "dragon-browser-headless"
+path = "src/headless.rs"
+required-features = ["headless"]
+
+[features]
+headless = []
 
 [dependencies]
 boa_engine = "0.22"

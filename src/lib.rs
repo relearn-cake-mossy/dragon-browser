@@ -1,5 +1,5 @@
 mod css;
-pub use css::{StyledBlock, TextAlignment, TextStyle};
+pub use css::{RenderNode, StyledBlock, TextAlignment, TextStyle};
 
 use std::io::Read;
 use std::time::Duration;
@@ -14,8 +14,9 @@ const MAX_STYLESHEETS: usize = 8;
 const MAX_STYLESHEET_BYTES: u64 = 512 * 1024;
 const MAX_IMAGES: usize = 8;
 const MAX_IMAGE_BYTES: u64 = 1024 * 1024;
-const MAX_INLINE_SCRIPTS: usize = 16;
+const MAX_SCRIPTS: usize = 32;
 const MAX_INLINE_SCRIPT_BYTES: usize = 64 * 1024;
+const MAX_EXTERNAL_SCRIPT_BYTES: u64 = 512 * 1024;
 const MAX_SCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_SCRIPT_LOOP_ITERATIONS: u64 = 10_000;
 const OMITTED_ELEMENTS: &[&str] = &["noscript", "script", "style", "svg"];
@@ -25,6 +26,7 @@ pub struct Article {
     pub title: String,
     pub text: String,
     pub blocks: Vec<StyledBlock>,
+    pub render_tree: RenderNode,
     pub images: Vec<ArticleImage>,
     pub resource_warnings: Vec<String>,
 }
@@ -72,9 +74,21 @@ pub fn load_url(url: &str) -> Result<Article, DragonError> {
     };
     let html = String::from_utf8_lossy(&bytes);
     let mut resource_warnings = Vec::new();
-    let html = execute_inline_scripts(html.as_ref(), &mut resource_warnings);
+    let initial_dom = parse_document(RcDom::default(), Default::default()).one(html.as_ref());
+    let base_url = css::document_base_url(&initial_dom.document, &final_url);
+    let scripts = load_scripts(
+        &initial_dom.document,
+        &base_url,
+        &agent,
+        &mut resource_warnings,
+    );
+    let html = execute_scripts(
+        html.as_ref(),
+        scripts,
+        final_url.as_str(),
+        &mut resource_warnings,
+    );
     let dom = parse_document(RcDom::default(), Default::default()).one(html.as_str());
-    let base_url = css::document_base_url(&dom.document, &final_url);
 
     let mut stylesheets = Vec::new();
     let document_stylesheets = css::document_stylesheets(&dom.document, &base_url);
@@ -159,6 +173,7 @@ fn parse_dom(document: &Handle, stylesheets: &[String], base_url: Option<&url::U
         title,
         text,
         blocks,
+        render_tree: css::render_tree(&root, stylesheets, base_url),
         images: Vec::new(),
         resource_warnings: Vec::new(),
     }
@@ -228,38 +243,291 @@ pub fn execute_javascript(source: &str) -> Result<String, String> {
     Ok(result.to_std_string_escaped())
 }
 
+fn load_scripts(
+    document: &Handle,
+    base_url: &url::Url,
+    agent: &ureq::Agent,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let sources = script_sources(document);
+    let mut scripts = Vec::new();
+    for (index, source) in sources.iter().take(MAX_SCRIPTS).enumerate() {
+        let script = match source {
+            ScriptSource::Inline(source) => {
+                if source.len() > MAX_INLINE_SCRIPT_BYTES {
+                    warnings.push(format!(
+                        "Đã bỏ qua script inline {} vì vượt giới hạn kích thước.",
+                        index + 1
+                    ));
+                    continue;
+                }
+                source.clone()
+            }
+            ScriptSource::External(source_url) => {
+                let Some(script_url) = resolve_script_url(base_url, source_url) else {
+                    warnings.push(format!(
+                        "Đã bỏ qua script ngoài {} vì URL không hợp lệ.",
+                        index + 1
+                    ));
+                    continue;
+                };
+                match fetch_bytes(agent, &script_url, MAX_EXTERNAL_SCRIPT_BYTES) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(error) => {
+                        warnings.push(format!("Không tải được script ngoài {script_url}: {error}"));
+                        continue;
+                    }
+                }
+            }
+        };
+        scripts.push(script);
+    }
+    if sources.len() > MAX_SCRIPTS {
+        warnings.push(format!(
+            "Đã bỏ qua script vượt giới hạn {MAX_SCRIPTS} script."
+        ));
+    }
+    scripts
+}
+
+fn resolve_script_url(base_url: &url::Url, source: &str) -> Option<String> {
+    let url = base_url.join(source).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+#[cfg(test)]
 fn execute_inline_scripts(html: &str, warnings: &mut Vec<String>) -> String {
     let dom = parse_document(RcDom::default(), Default::default()).one(html);
-    let scripts = inline_scripts(&dom.document);
+    let scripts = script_sources(&dom.document)
+        .into_iter()
+        .filter_map(|source| match source {
+            ScriptSource::Inline(source) => Some(source),
+            ScriptSource::External(_) => None,
+        })
+        .collect();
+    execute_scripts(html, scripts, "https://example.test/", warnings)
+}
+
+fn execute_scripts(
+    html: &str,
+    scripts: Vec<String>,
+    page_url: &str,
+    warnings: &mut Vec<String>,
+) -> String {
     if scripts.is_empty() {
         return html.to_owned();
     }
 
+    let dom = parse_document(RcDom::default(), Default::default()).one(html);
+    let body = find_element(&dom.document, "body").unwrap_or_else(|| dom.document.clone());
+    let dom_model = dom_model_source(&body);
+    let location = location_model(page_url);
+    let platform = js_string(std::env::consts::OS);
     let mut context = Context::default();
     context
         .runtime_limits_mut()
         .set_loop_iteration_limit(MAX_SCRIPT_LOOP_ITERATIONS);
-    let bootstrap = "globalThis.__dragonWrites = []; \
-        globalThis.document = { \
-            write(...parts) { globalThis.__dragonWrites.push(parts.map(String).join('')); }, \
-            writeln(...parts) { globalThis.__dragonWrites.push(parts.map(String).join('') + '\\n'); } \
-        };";
-    if let Err(error) = context.eval(Source::from_bytes(bootstrap)) {
+    let bootstrap = format!(
+        r###"
+        globalThis.__dragonWrites = [];
+        globalThis.__dragonRoot = {dom_model};
+        globalThis.__dragonLocation = {location};
+        function __dragonEscape(value, attribute) {{
+            value = String(value);
+            value = value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            return attribute ? value.replace(/"/g, "&quot;") : value;
+        }}
+        function __dragonSerialize(node) {{
+            if (node._raw) return node.nodeValue;
+            if (node.nodeType === 3) return __dragonEscape(node.nodeValue, false);
+            if (node.nodeType === 8) return "<!--" + node.nodeValue + "-->";
+            if (node.nodeType !== 1) return node.childNodes.map(__dragonSerialize).join("");
+            var tag = node.tagName.toLowerCase();
+            var output = "<" + tag;
+            Object.keys(node._attributes).forEach(function(key) {{
+                output += " " + key + '="' + __dragonEscape(node._attributes[key], true) + '"';
+            }});
+            output += ">";
+            if (/^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/.test(tag)) return output;
+            return output + node.childNodes.map(__dragonSerialize).join("") + "</" + tag + ">";
+        }}
+        function __dragonCreate(model, parent) {{
+            var node;
+            if (model[0] === "e") {{
+                node = {{ nodeType: 1, tagName: model[1].toUpperCase(), nodeName: model[1].toUpperCase(),
+                    parentNode: parent || null, childNodes: [], _attributes: Object.create(null) }};
+                model[2].forEach(function(pair) {{ node._attributes[pair[0]] = pair[1]; }});
+                model[3].forEach(function(child) {{ node.childNodes.push(__dragonCreate(child, node)); }});
+            }} else {{
+                node = {{ nodeType: model[0] === "c" ? 8 : 3, nodeName: model[0] === "c" ? "#comment" : "#text",
+                    nodeValue: model[1], parentNode: parent || null, childNodes: [], _attributes: Object.create(null) }};
+            }}
+            Object.defineProperty(node, "textContent", {{
+                get: function() {{
+                    if (this.nodeType === 3 || this.nodeType === 8) return this.nodeValue;
+                    return this.childNodes.map(function(child) {{ return child.textContent; }}).join("");
+                }},
+                set: function(value) {{
+                    this.childNodes.forEach(function(child) {{ child.parentNode = null; }});
+                    this.childNodes = [];
+                    if (this.nodeType === 3 || this.nodeType === 8) this.nodeValue = String(value);
+                    else if (String(value) !== "") this.appendChild(document.createTextNode(String(value)));
+                }}
+            }});
+            Object.defineProperty(node, "innerHTML", {{
+                get: function() {{ return this.childNodes.map(__dragonSerialize).join(""); }},
+                set: function(value) {{
+                    this.childNodes.forEach(function(child) {{ child.parentNode = null; }});
+                    this.childNodes = [];
+                    if (String(value) !== "") {{
+                        var raw = document.createTextNode(String(value));
+                        raw._raw = true;
+                        this.appendChild(raw);
+                    }}
+                }}
+            }});
+            node.getAttribute = function(name) {{
+                name = String(name).toLowerCase();
+                return Object.prototype.hasOwnProperty.call(this._attributes, name) ? this._attributes[name] : null;
+            }};
+            node.hasAttribute = function(name) {{ return this.getAttribute(name) !== null; }};
+            node.setAttribute = function(name, value) {{ this._attributes[String(name).toLowerCase()] = String(value); }};
+            node.removeAttribute = function(name) {{ delete this._attributes[String(name).toLowerCase()]; }};
+            node.addEventListener = function() {{}};
+            node.removeEventListener = function() {{}};
+            node.dispatchEvent = function() {{ return true; }};
+            node.appendChild = function(child) {{
+                if (child.parentNode) child.parentNode.removeChild(child);
+                child.parentNode = this;
+                this.childNodes.push(child);
+                return child;
+            }};
+            node.insertBefore = function(child, reference) {{
+                if (!reference) return this.appendChild(child);
+                var index = this.childNodes.indexOf(reference);
+                if (index < 0) throw new Error("Reference node is not a child");
+                if (child.parentNode) child.parentNode.removeChild(child);
+                child.parentNode = this;
+                this.childNodes.splice(index, 0, child);
+                return child;
+            }};
+            node.removeChild = function(child) {{
+                var index = this.childNodes.indexOf(child);
+                if (index < 0) throw new Error("Node is not a child");
+                this.childNodes.splice(index, 1);
+                child.parentNode = null;
+                return child;
+            }};
+            node.querySelectorAll = function(selector) {{ return __dragonQuery(this, selector, false); }};
+            node.querySelector = function(selector) {{ return __dragonQuery(this, selector, true)[0] || null; }};
+            return node;
+        }}
+        function __dragonMatches(node, selector) {{
+            selector = String(selector).trim();
+            if (!selector || selector.indexOf(" ") >= 0 || selector.indexOf(">") >= 0 ||
+                selector.indexOf("+") >= 0 || selector.indexOf("~") >= 0 ||
+                selector.indexOf(":") >= 0 || selector.indexOf("[") >= 0 ||
+                selector.indexOf(",") >= 0 || node.nodeType !== 1) return false;
+            var id = selector.match(/#([\w-]+)/);
+            if (id) {{
+                if (node.getAttribute("id") !== id[1]) return false;
+                selector = selector.replace(id[0], "");
+            }}
+            var classes = selector.match(/\.([\w-]+)/g) || [];
+            for (var i = 0; i < classes.length; i++) {{
+                var name = classes[i].slice(1);
+                if ((" " + (node.getAttribute("class") || "").replace(/\s+/g, " ") + " ").indexOf(" " + name + " ") < 0) return false;
+            }}
+            selector = selector.replace(/\.([\w-]+)/g, "");
+            return selector === "" || selector === "*" || node.tagName.toLowerCase() === selector.toLowerCase();
+        }}
+        function __dragonQuery(root, selector, firstOnly) {{
+            var found = [], pending = root.childNodes.slice().reverse();
+            while (pending.length) {{
+                var node = pending.pop();
+                if (__dragonMatches(node, selector)) {{
+                    found.push(node);
+                    if (firstOnly) return found;
+                }}
+                for (var i = node.childNodes.length - 1; i >= 0; i--) pending.push(node.childNodes[i]);
+            }}
+            return found;
+        }}
+        var document = {{
+            body: null,
+            URL: globalThis.__dragonLocation.href,
+            documentURI: globalThis.__dragonLocation.href,
+            baseURI: globalThis.__dragonLocation.href,
+            readyState: "complete",
+            write: function() {{ globalThis.__dragonWrites.push(Array.prototype.join.call(arguments, "")); }},
+            writeln: function() {{ globalThis.__dragonWrites.push(Array.prototype.join.call(arguments, "") + "\n"); }},
+            createElement: function(tag) {{ return __dragonCreate(["e", String(tag).toLowerCase(), [], []], null); }},
+            createTextNode: function(text) {{ return __dragonCreate(["t", String(text)], null); }},
+            getElementById: function(id) {{ return this.querySelector("#" + String(id)); }},
+            querySelector: function(selector) {{
+                if (__dragonMatches(this.body, selector)) return this.body;
+                return this.body.querySelector(selector);
+            }},
+            querySelectorAll: function(selector) {{
+                var found = this.body.querySelectorAll(selector);
+                if (__dragonMatches(this.body, selector)) found.unshift(this.body);
+                return found;
+            }},
+            getElementsByTagName: function(tag) {{ return this.querySelectorAll(String(tag)); }},
+            getElementsByClassName: function(name) {{ return this.querySelectorAll("." + String(name).trim().replace(/\\s+/g, ".")); }},
+            addEventListener: function() {{}},
+            removeEventListener: function() {{}},
+            dispatchEvent: function() {{ return true; }}
+        }};
+        document.body = __dragonCreate(globalThis.__dragonRoot, null);
+        globalThis.document = document;
+        globalThis.window = globalThis;
+        globalThis.self = globalThis;
+        globalThis.navigator = {{
+            userAgent: "DragonBrowser/0.0.2",
+            appName: "DragonBrowser",
+            platform: {platform},
+            language: "vi-VN",
+            languages: ["vi-VN", "vi"],
+            onLine: true,
+            cookieEnabled: false,
+            javaEnabled: function() {{ return false; }}
+        }};
+        globalThis.location = globalThis.__dragonLocation;
+        globalThis.console = {{
+            log: function() {{}}, info: function() {{}}, warn: function() {{}},
+            error: function() {{}}, debug: function() {{}}
+        }};
+        globalThis.addEventListener = function() {{}};
+        globalThis.removeEventListener = function() {{}};
+        globalThis.dispatchEvent = function() {{ return true; }};
+        globalThis.setTimeout = function(callback) {{
+            if (typeof callback === "function") callback.apply(globalThis, Array.prototype.slice.call(arguments, 2));
+            return 1;
+        }};
+        globalThis.setInterval = function(callback) {{
+            if (typeof callback === "function") callback.apply(globalThis, Array.prototype.slice.call(arguments, 2));
+            return 1;
+        }};
+        globalThis.clearTimeout = function() {{}};
+        globalThis.clearInterval = function() {{}};
+        globalThis.requestAnimationFrame = function(callback) {{
+            if (typeof callback === "function") callback(0);
+            return 1;
+        }};
+        globalThis.cancelAnimationFrame = function() {{}};
+        globalThis.__dragonSerializeBody = function() {{ return document.body.innerHTML; }};
+        "###
+    );
+    if let Err(error) = context.eval(Source::from_bytes(&bootstrap)) {
         warnings.push(format!("Không khởi tạo được JavaScript: {error}"));
         return html.to_owned();
     }
 
     let mut writes = String::new();
-    for (index, script) in scripts.iter().take(MAX_INLINE_SCRIPTS).enumerate() {
-        if script.len() > MAX_INLINE_SCRIPT_BYTES {
-            warnings.push(format!(
-                "Đã bỏ qua script inline {} vì vượt giới hạn kích thước.",
-                index + 1
-            ));
-            continue;
-        }
+    for (index, script) in scripts.iter().take(MAX_SCRIPTS).enumerate() {
         if let Err(error) = context.eval(Source::from_bytes(script)) {
-            warnings.push(format!("Lỗi JavaScript inline {}: {error}", index + 1));
+            warnings.push(format!("Lỗi JavaScript {}: {error}", index + 1));
         }
         match context.eval(Source::from_bytes(
             "globalThis.__dragonWrites.splice(0).join('')",
@@ -285,16 +553,161 @@ fn execute_inline_scripts(html: &str, warnings: &mut Vec<String>) -> String {
             )),
         }
     }
-    if scripts.len() > MAX_INLINE_SCRIPTS {
+    if scripts.len() > MAX_SCRIPTS {
         warnings.push(format!(
-            "Đã bỏ qua script inline vượt giới hạn {MAX_INLINE_SCRIPTS} script."
+            "Đã bỏ qua script vượt giới hạn {MAX_SCRIPTS} script."
         ));
     }
 
-    insert_document_write(html, &writes)
+    let body_html = match context.eval(Source::from_bytes("globalThis.__dragonSerializeBody()")) {
+        Ok(value) => match value.to_string(&mut context) {
+            Ok(value) => value.to_std_string_escaped(),
+            Err(error) => {
+                warnings.push(format!(
+                    "Không đọc được DOM sau khi chạy JavaScript: {error}"
+                ));
+                return insert_document_write(html, &writes);
+            }
+        },
+        Err(error) => {
+            warnings.push(format!(
+                "Không thể dựng lại DOM sau khi chạy JavaScript: {error}"
+            ));
+            return insert_document_write(html, &writes);
+        }
+    };
+    replace_body_content(html, &format!("{writes}{body_html}"))
 }
 
-fn inline_scripts(document: &Handle) -> Vec<String> {
+fn dom_model_source(root: &Handle) -> String {
+    match &root.data {
+        NodeData::Element { name, attrs, .. } => {
+            let attributes = attrs
+                .borrow()
+                .iter()
+                .map(|attribute| {
+                    format!(
+                        "[{},{}]",
+                        js_string(attribute.name.local.as_ref()),
+                        js_string(&attribute.value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let children = root
+                .children
+                .borrow()
+                .iter()
+                .map(dom_model_source)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "[\"e\",{},{},[{}]]",
+                js_string(name.local.as_ref()),
+                format!("[{}]", attributes),
+                children
+            )
+        }
+        NodeData::Text { contents } => {
+            format!("[\"t\",{}]", js_string(&contents.borrow()))
+        }
+        NodeData::Comment { contents } => {
+            format!("[\"c\",{}]", js_string(contents))
+        }
+        _ => {
+            let children = root
+                .children
+                .borrow()
+                .iter()
+                .map(dom_model_source)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[\"f\",\"\",[],[{}]]", children)
+        }
+    }
+}
+
+fn location_model(page_url: &str) -> String {
+    let Ok(url) = url::Url::parse(page_url) else {
+        return "({href:\"about:blank\",protocol:\"about:\",host:\"\",hostname:\"\",port:\"\",pathname:\"blank\",search:\"\",hash:\"\",origin:\"null\"})".into();
+    };
+    let protocol = format!("{}:", url.scheme());
+    let host = url.host_str().unwrap_or_default();
+    let port = url.port().map_or_else(String::new, |port| port.to_string());
+    let host_port = if port.is_empty() {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    };
+    let pathname = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    format!(
+        "({{href:{},protocol:{},host:{},hostname:{},port:{},pathname:{},search:{},hash:{},origin:{}}})",
+        js_string(url.as_str()),
+        js_string(&protocol),
+        js_string(&host_port),
+        js_string(host),
+        js_string(&port),
+        js_string(pathname),
+        js_string(&url.query().map_or_else(String::new, |query| format!("?{query}"))),
+        js_string(&url.fragment().map_or_else(String::new, |fragment| format!("#{fragment}"))),
+        js_string(&url.origin().ascii_serialization()),
+    )
+}
+
+fn js_string(value: &str) -> String {
+    let mut result = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\u{08}' => result.push_str("\\b"),
+            '\u{0c}' => result.push_str("\\f"),
+            '\u{2028}' => result.push_str("\\u2028"),
+            '\u{2029}' => result.push_str("\\u2029"),
+            character if character.is_control() => {
+                result.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => result.push(character),
+        }
+    }
+    result.push('"');
+    result
+}
+
+fn replace_body_content(html: &str, content: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let Some(body_start) = lower.find("<body") else {
+        return format!("{html}{content}");
+    };
+    let Some(body_open_end) = html[body_start..].find('>') else {
+        return format!("{html}{content}");
+    };
+    let content_start = body_start + body_open_end + 1;
+    let Some(body_end) = lower[content_start..].find("</body") else {
+        return format!("{}{content}", &html[..content_start]);
+    };
+    let content_end = content_start + body_end;
+    format!(
+        "{}{}{}",
+        &html[..content_start],
+        content,
+        &html[content_end..]
+    )
+}
+
+enum ScriptSource {
+    Inline(String),
+    External(String),
+}
+
+fn script_sources(document: &Handle) -> Vec<ScriptSource> {
     let mut scripts = Vec::new();
     let mut pending = vec![document.clone()];
     while let Some(node) = pending.pop() {
@@ -307,10 +720,14 @@ fn inline_scripts(document: &Handle) -> Vec<String> {
             let is_javascript = script_type.is_empty()
                 || script_type == "text/javascript"
                 || script_type == "application/javascript";
-            if !has_source && is_javascript {
+            if is_javascript && has_source {
+                if let Some(source) = attribute(&node, "src") {
+                    scripts.push(ScriptSource::External(source));
+                }
+            } else if is_javascript {
                 let source = text_content_for_script(&node);
                 if !source.trim().is_empty() {
-                    scripts.push(source);
+                    scripts.push(ScriptSource::Inline(source));
                 }
             }
             continue;
@@ -451,6 +868,24 @@ mod tests {
     }
 
     #[test]
+    fn render_tree_preserves_nested_html_and_inline_styles() {
+        let article = parse_html(
+            "<style>.accent { color: #123 }</style>\
+             <main><p>Hello <strong>world</strong> <em class='accent'>again</em></p></main>",
+        );
+        let main = &article.render_tree.children[0];
+        let paragraph = &main.children[0];
+
+        assert_eq!(main.tag.as_deref(), Some("main"));
+        assert_eq!(paragraph.tag.as_deref(), Some("p"));
+        assert_eq!(paragraph.children[1].tag.as_deref(), Some("strong"));
+        assert_eq!(paragraph.children[1].style.bold, Some(true));
+        assert_eq!(paragraph.children[3].tag.as_deref(), Some("em"));
+        assert_eq!(paragraph.children[3].style.italic, true);
+        assert_eq!(paragraph.children[3].style.color, Some([17, 34, 51]));
+    }
+
+    #[test]
     fn executes_javascript_and_returns_the_result() {
         assert_eq!(
             execute_javascript("const title = 'Dragon'; title + ' Core'").unwrap(),
@@ -468,6 +903,62 @@ mod tests {
     fn refuses_non_web_urls() {
         let error = load_url("file:///etc/passwd").unwrap_err();
         assert!(matches!(error, super::DragonError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn loads_external_scripts_and_inserts_document_write_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                drop(reader);
+                let (content_type, body): (&str, &[u8]) = if request_line.contains("/page.html") {
+                    (
+                        "text/html",
+                        b"<html><body><script src='/app.js'></script>\
+                              <script>document.write('<p>Inline script</p>')</script>\
+                              </body></html>",
+                    )
+                } else {
+                    (
+                        "application/javascript",
+                        b"document.write('<p>External script</p>')",
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let article = load_url(&format!("http://{address}/page.html")).unwrap();
+        server.join().unwrap();
+
+        assert!(article
+            .blocks
+            .iter()
+            .any(|block| block.text == "External script"));
+        assert!(article
+            .blocks
+            .iter()
+            .any(|block| block.text == "Inline script"));
+        assert!(article.resource_warnings.is_empty());
     }
 
     #[test]
@@ -568,6 +1059,57 @@ mod tests {
     }
 
     #[test]
+    fn supports_basic_dom_queries_and_mutations() {
+        let mut warnings = Vec::new();
+        let html = execute_inline_scripts(
+            "<body><main id='content'><p class='old'>Before</p></main>\
+             <script>\
+             var paragraph = document.getElementById('content').querySelector('.old');\
+             paragraph.textContent = 'After';\
+             var extra = document.createElement('p');\
+             extra.innerHTML = '<strong>Added</strong>';\
+             document.getElementById('content').appendChild(extra);\
+             </script></body>",
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty());
+        let page = parse_html(&html);
+        assert!(page.blocks.iter().any(|block| block.text == "After"));
+        assert!(page.blocks.iter().any(|block| block.text == "Added"));
+    }
+
+    #[test]
+    fn provides_basic_navigator_location_console_and_timer_apis() {
+        let mut warnings = Vec::new();
+        let html = execute_inline_scripts(
+            "<body><script>\
+             console.log('test');\
+             setTimeout(function() { document.write('<p>' + navigator.language + ' ' + location.pathname + '</p>'); }, 0);\
+             </script></body>",
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty());
+        assert!(html.contains("vi-VN /"));
+    }
+
+    #[test]
+    fn executes_at_most_32_scripts() {
+        let scripts = (0..33)
+            .map(|index| format!("<script>document.write('{index},')</script>"))
+            .collect::<String>();
+        let mut warnings = Vec::new();
+        let html = execute_inline_scripts(&format!("<body>{scripts}</body>"), &mut warnings);
+
+        let rendered = parse_html(&html).text;
+        assert!(rendered.ends_with("31,"));
+        assert!(!rendered.ends_with("32,"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("32"));
+    }
+
+    #[test]
     fn limits_inline_script_loop_iterations() {
         let mut warnings = Vec::new();
         let html = execute_inline_scripts(
@@ -577,6 +1119,6 @@ mod tests {
 
         assert!(html.contains("still loads"));
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("JavaScript inline"));
+        assert!(warnings[0].contains("JavaScript"));
     }
 }

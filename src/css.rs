@@ -6,6 +6,8 @@ pub struct TextStyle {
     pub background_color: Option<[u8; 3]>,
     pub font_size: Option<f32>,
     pub bold: Option<bool>,
+    pub italic: bool,
+    pub underline: bool,
     pub text_align: Option<TextAlignment>,
     pub hidden: bool,
 }
@@ -25,6 +27,16 @@ pub struct StyledBlock {
     pub style: TextStyle,
     pub image_url: Option<String>,
     pub image_alt: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderNode {
+    pub tag: Option<String>,
+    pub text: String,
+    pub style: TextStyle,
+    pub image_url: Option<String>,
+    pub image_alt: String,
+    pub children: Vec<RenderNode>,
 }
 
 #[derive(Debug)]
@@ -65,7 +77,8 @@ pub fn styled_blocks(
             continue;
         }
 
-        let style = cascade_style(&node, &inherited, &rules);
+        let mut style = cascade_style(&node, &inherited, &rules);
+        apply_element_defaults(tag, &mut style);
         if style.hidden {
             continue;
         }
@@ -136,6 +149,71 @@ pub fn styled_blocks(
     }
 
     blocks
+}
+
+pub fn render_tree(
+    root: &Handle,
+    stylesheets: &[String],
+    base_url: Option<&url::Url>,
+) -> RenderNode {
+    let rules = parse_rules(stylesheets);
+    build_render_node(root, &TextStyle::default(), &rules, base_url)
+}
+
+fn build_render_node(
+    node: &Handle,
+    inherited: &TextStyle,
+    rules: &[Rule],
+    base_url: Option<&url::Url>,
+) -> RenderNode {
+    match &node.data {
+        NodeData::Text { contents } => RenderNode {
+            tag: None,
+            text: contents.borrow().to_string(),
+            style: inherited.clone(),
+            image_url: None,
+            image_alt: String::new(),
+            children: Vec::new(),
+        },
+        NodeData::Element { .. } => {
+            let tag = element_name(node).unwrap_or_default();
+            let mut style = cascade_style(node, inherited, rules);
+            apply_element_defaults(tag, &mut style);
+            let hidden = style.hidden || matches!(tag, "script" | "noscript" | "style");
+            let children = if hidden {
+                Vec::new()
+            } else {
+                node.children
+                    .borrow()
+                    .iter()
+                    .map(|child| build_render_node(child, &style, rules, base_url))
+                    .collect()
+            };
+            RenderNode {
+                tag: (!hidden).then(|| tag.to_owned()),
+                text: String::new(),
+                style,
+                image_url: (tag == "img")
+                    .then(|| image_source(node, base_url))
+                    .flatten(),
+                image_alt: attribute(node, "alt").unwrap_or_default(),
+                children,
+            }
+        }
+        _ => RenderNode {
+            tag: None,
+            text: String::new(),
+            style: inherited.clone(),
+            image_url: None,
+            image_alt: String::new(),
+            children: node
+                .children
+                .borrow()
+                .iter()
+                .map(|child| build_render_node(child, inherited, rules, base_url))
+                .collect(),
+        },
+    }
 }
 
 pub fn embedded_stylesheets(root: &Handle) -> Vec<String> {
@@ -329,6 +407,12 @@ fn parse_declarations(declarations: &str) -> TextStyle {
                         || value.parse::<u16>().is_ok_and(|weight| weight >= 600),
                 );
             }
+            "font-style" => style.italic = value == "italic" || value == "oblique",
+            "text-decoration" => {
+                style.underline = value
+                    .split_ascii_whitespace()
+                    .any(|part| part == "underline")
+            }
             _ => {}
         }
     }
@@ -343,6 +427,8 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
         "background-color",
         "font-size",
         "font-weight",
+        "font-style",
+        "text-decoration",
         "text-align",
         "display",
     ] {
@@ -354,6 +440,8 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
                 "background-color" => rule.style.background_color.is_some(),
                 "font-size" => rule.style.font_size.is_some(),
                 "font-weight" => rule.style.bold.is_some(),
+                "font-style" => rule.style.italic,
+                "text-decoration" => rule.style.underline,
                 "text-align" => rule.style.text_align.is_some(),
                 _ => rule.style.hidden,
             })
@@ -364,6 +452,8 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
                 "background-color" => style.background_color = rule.style.background_color,
                 "font-size" => style.font_size = rule.style.font_size,
                 "font-weight" => style.bold = rule.style.bold,
+                "font-style" => style.italic = rule.style.italic,
+                "text-decoration" => style.underline = rule.style.underline,
                 "text-align" => style.text_align = rule.style.text_align,
                 _ => style.hidden = rule.style.hidden,
             }
@@ -384,12 +474,38 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
         if inline.bold.is_some() {
             style.bold = inline.bold;
         }
+        style.italic |= inline.italic;
+        style.underline |= inline.underline;
         if inline.text_align.is_some() {
             style.text_align = inline.text_align;
         }
         style.hidden |= inline.hidden;
     }
     style
+}
+
+fn apply_element_defaults(tag: &str, style: &mut TextStyle) {
+    if style.bold.is_none()
+        && (heading_level(tag).is_some() || matches!(tag, "b" | "strong" | "th"))
+    {
+        style.bold = Some(true);
+    }
+    if style.font_size.is_none() {
+        style.font_size = match heading_level(tag) {
+            Some(1) => Some(30.0),
+            Some(2) => Some(26.0),
+            Some(3) => Some(22.0),
+            Some(4) => Some(19.0),
+            Some(5) => Some(17.0),
+            Some(6) => Some(16.0),
+            _ => None,
+        };
+    }
+    style.italic |= matches!(tag, "i" | "em" | "cite" | "dfn" | "var");
+    style.underline |= matches!(tag, "u" | "ins" | "a");
+    if tag == "a" && style.color.is_none() {
+        style.color = Some([0, 102, 204]);
+    }
 }
 
 fn selector_matches(selector: &str, node: &Handle) -> bool {
