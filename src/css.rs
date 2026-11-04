@@ -13,6 +13,12 @@ pub struct TextStyle {
     pub max_width: Option<f32>,
     pub margin: [f32; 4],
     pub padding: [f32; 4],
+    pub margin_set: [bool; 4],
+    pub margin_auto: [bool; 4],
+    pub padding_set: [bool; 4],
+    pub flex_direction: Option<FlexDirection>,
+    pub row_gap: Option<f32>,
+    pub column_gap: Option<f32>,
     pub text_align: Option<TextAlignment>,
     pub hidden: bool,
 }
@@ -23,6 +29,14 @@ pub enum DisplayMode {
     Inline,
     InlineBlock,
     Flex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,18 +440,46 @@ fn parse_declarations(declarations: &str) -> TextStyle {
                     _ => None,
                 };
             }
+            "flex-direction" => {
+                style.flex_direction = match value.as_str() {
+                    "row" => Some(FlexDirection::Row),
+                    "row-reverse" => Some(FlexDirection::RowReverse),
+                    "column" => Some(FlexDirection::Column),
+                    "column-reverse" => Some(FlexDirection::ColumnReverse),
+                    _ => None,
+                };
+            }
+            "gap" => {
+                if let Some((row, column)) = parse_gap_values(&value) {
+                    style.row_gap = Some(row);
+                    style.column_gap = Some(column);
+                }
+            }
+            "row-gap" => style.row_gap = parse_layout_length(&value),
+            "column-gap" => style.column_gap = parse_layout_length(&value),
             "width" => style.width = parse_layout_length(&value),
             "max-width" => style.max_width = parse_layout_length(&value),
-            "margin" => style.margin = parse_box_values(&value).unwrap_or(style.margin),
-            "padding" => style.padding = parse_box_values(&value).unwrap_or(style.padding),
-            "margin-top" => style.margin[0] = parse_layout_length(&value).unwrap_or(0.0),
-            "margin-right" => style.margin[1] = parse_layout_length(&value).unwrap_or(0.0),
-            "margin-bottom" => style.margin[2] = parse_layout_length(&value).unwrap_or(0.0),
-            "margin-left" => style.margin[3] = parse_layout_length(&value).unwrap_or(0.0),
-            "padding-top" => style.padding[0] = parse_layout_length(&value).unwrap_or(0.0),
-            "padding-right" => style.padding[1] = parse_layout_length(&value).unwrap_or(0.0),
-            "padding-bottom" => style.padding[2] = parse_layout_length(&value).unwrap_or(0.0),
-            "padding-left" => style.padding[3] = parse_layout_length(&value).unwrap_or(0.0),
+            "margin" => {
+                if let Some((values, auto)) = parse_margin_box_values(&value) {
+                    style.margin = values;
+                    style.margin_auto = auto;
+                    style.margin_set = [true; 4];
+                }
+            }
+            "padding" => {
+                if let Some(values) = parse_box_values(&value) {
+                    style.padding = values;
+                    style.padding_set = [true; 4];
+                }
+            }
+            "margin-top" => set_margin_side(&mut style, 0, &value),
+            "margin-right" => set_margin_side(&mut style, 1, &value),
+            "margin-bottom" => set_margin_side(&mut style, 2, &value),
+            "margin-left" => set_margin_side(&mut style, 3, &value),
+            "padding-top" => set_box_side(&mut style.padding, &mut style.padding_set, 0, &value),
+            "padding-right" => set_box_side(&mut style.padding, &mut style.padding_set, 1, &value),
+            "padding-bottom" => set_box_side(&mut style.padding, &mut style.padding_set, 2, &value),
+            "padding-left" => set_box_side(&mut style.padding, &mut style.padding_set, 3, &value),
             "font-weight" => {
                 style.bold = Some(
                     value == "bold"
@@ -455,6 +497,25 @@ fn parse_declarations(declarations: &str) -> TextStyle {
         }
     }
     style
+}
+
+fn set_box_side(values: &mut [f32; 4], set: &mut [bool; 4], side: usize, value: &str) {
+    if let Some(value) = parse_layout_length(value) {
+        values[side] = value;
+        set[side] = true;
+    }
+}
+
+fn set_margin_side(style: &mut TextStyle, side: usize, value: &str) {
+    if value == "auto" {
+        style.margin[side] = 0.0;
+        style.margin_auto[side] = true;
+        style.margin_set[side] = true;
+    } else if let Some(value) = parse_layout_length(value) {
+        style.margin[side] = value;
+        style.margin_auto[side] = false;
+        style.margin_set[side] = true;
+    }
 }
 
 fn parse_layout_length(value: &str) -> Option<f32> {
@@ -485,6 +546,42 @@ fn parse_box_values(value: &str) -> Option<[f32; 4]> {
     }
 }
 
+fn parse_margin_box_values(value: &str) -> Option<([f32; 4], [bool; 4])> {
+    let values = value
+        .split_ascii_whitespace()
+        .map(|part| {
+            if part == "auto" {
+                Some((0.0, true))
+            } else {
+                parse_layout_length(part).map(|value| (value, false))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [top, right, bottom, left] = match values.as_slice() {
+        [all] => [*all; 4],
+        [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
+        [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
+        [top, right, bottom, left] => [*top, *right, *bottom, *left],
+        _ => return None,
+    };
+    Some((
+        [top.0, right.0, bottom.0, left.0],
+        [top.1, right.1, bottom.1, left.1],
+    ))
+}
+
+fn parse_gap_values(value: &str) -> Option<(f32, f32)> {
+    let values = value
+        .split_ascii_whitespace()
+        .map(parse_layout_length)
+        .collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some((*all, *all)),
+        [row, column] => Some((*row, *column)),
+        _ => None,
+    }
+}
+
 fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextStyle {
     let mut style = inherited.clone();
     style.background_color = None;
@@ -492,7 +589,13 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
     style.width = None;
     style.max_width = None;
     style.margin = [0.0; 4];
+    style.margin_auto = [false; 4];
     style.padding = [0.0; 4];
+    style.margin_set = [false; 4];
+    style.padding_set = [false; 4];
+    style.flex_direction = None;
+    style.row_gap = None;
+    style.column_gap = None;
     for property in [
         "color",
         "background-color",
@@ -501,10 +604,11 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
         "font-style",
         "text-decoration",
         "display",
+        "flex-direction",
+        "row-gap",
+        "column-gap",
         "width",
         "max-width",
-        "margin",
-        "padding",
         "text-align",
     ] {
         let winner = rules
@@ -518,10 +622,11 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
                 "font-style" => rule.style.italic,
                 "text-decoration" => rule.style.underline,
                 "display" => rule.style.display.is_some() || rule.style.hidden,
+                "flex-direction" => rule.style.flex_direction.is_some(),
+                "row-gap" => rule.style.row_gap.is_some(),
+                "column-gap" => rule.style.column_gap.is_some(),
                 "width" => rule.style.width.is_some(),
                 "max-width" => rule.style.max_width.is_some(),
-                "margin" => rule.style.margin != [0.0; 4],
-                "padding" => rule.style.padding != [0.0; 4],
                 "text-align" => rule.style.text_align.is_some(),
                 _ => false,
             })
@@ -538,13 +643,36 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
                     style.display = rule.style.display;
                     style.hidden = rule.style.hidden;
                 }
+                "flex-direction" => style.flex_direction = rule.style.flex_direction,
+                "row-gap" => style.row_gap = rule.style.row_gap,
+                "column-gap" => style.column_gap = rule.style.column_gap,
                 "width" => style.width = rule.style.width,
                 "max-width" => style.max_width = rule.style.max_width,
-                "margin" => style.margin = rule.style.margin,
-                "padding" => style.padding = rule.style.padding,
                 "text-align" => style.text_align = rule.style.text_align,
                 _ => {}
             }
+        }
+    }
+
+    for side in 0..4 {
+        if let Some(rule) = rules
+            .iter()
+            .filter(|rule| selector_matches(&rule.selector, node))
+            .filter(|rule| rule.style.margin_set[side])
+            .max_by_key(|rule| (rule.specificity, rule.order))
+        {
+            style.margin[side] = rule.style.margin[side];
+            style.margin_auto[side] = rule.style.margin_auto[side];
+            style.margin_set[side] = true;
+        }
+        if let Some(rule) = rules
+            .iter()
+            .filter(|rule| selector_matches(&rule.selector, node))
+            .filter(|rule| rule.style.padding_set[side])
+            .max_by_key(|rule| (rule.specificity, rule.order))
+        {
+            style.padding[side] = rule.style.padding[side];
+            style.padding_set[side] = true;
         }
     }
 
@@ -568,17 +696,31 @@ fn cascade_style(node: &Handle, inherited: &TextStyle, rules: &[Rule]) -> TextSt
             style.display = inline.display;
             style.hidden = inline.hidden;
         }
+        if inline.flex_direction.is_some() {
+            style.flex_direction = inline.flex_direction;
+        }
+        if inline.row_gap.is_some() {
+            style.row_gap = inline.row_gap;
+        }
+        if inline.column_gap.is_some() {
+            style.column_gap = inline.column_gap;
+        }
         if inline.width.is_some() {
             style.width = inline.width;
         }
         if inline.max_width.is_some() {
             style.max_width = inline.max_width;
         }
-        if inline.margin != [0.0; 4] {
-            style.margin = inline.margin;
-        }
-        if inline.padding != [0.0; 4] {
-            style.padding = inline.padding;
+        for side in 0..4 {
+            if inline.margin_set[side] {
+                style.margin[side] = inline.margin[side];
+                style.margin_auto[side] = inline.margin_auto[side];
+                style.margin_set[side] = true;
+            }
+            if inline.padding_set[side] {
+                style.padding[side] = inline.padding[side];
+                style.padding_set[side] = true;
+            }
         }
         if inline.text_align.is_some() {
             style.text_align = inline.text_align;
@@ -986,11 +1128,47 @@ mod tests {
 
     #[test]
     fn display_flex_is_kept_in_render_tree() {
-        let stylesheet = ".row { display: flex }";
+        let stylesheet = ".row { display: flex; flex-direction: column; gap: 12px 8px }";
         let html = format!("<style>{stylesheet}</style><div class='row'><span>x</span></div>");
         let dom = parse_document(RcDom::default(), Default::default()).one(html);
         let tree = render_tree(&dom.document, &[stylesheet.into()], None);
 
         assert_eq!(find(&tree, "div").style.display, Some(DisplayMode::Flex));
+        assert_eq!(
+            find(&tree, "div").style.flex_direction,
+            Some(super::FlexDirection::Column)
+        );
+        assert_eq!(find(&tree, "div").style.row_gap, Some(12.0));
+        assert_eq!(find(&tree, "div").style.column_gap, Some(8.0));
+    }
+
+    #[test]
+    fn cascades_box_sides_independently_and_honors_zero_overrides() {
+        let stylesheet = ".card { margin: 12px 8px; padding: 6px } \
+                          main .card { margin-left: 0; padding-top: 0 }";
+        let html = format!(
+            "<style>{stylesheet}</style><main><div class='card' style='margin-bottom: 0; padding-right: 0'>x</div></main>"
+        );
+        let dom = parse_document(RcDom::default(), Default::default()).one(html);
+        let tree = render_tree(&dom.document, &[stylesheet.into()], None);
+        let card = find(&tree, "div");
+
+        assert_eq!(card.style.margin, [12.0, 8.0, 0.0, 0.0]);
+        assert_eq!(card.style.padding, [0.0, 0.0, 6.0, 6.0]);
+        assert_eq!(card.style.margin_set, [true; 4]);
+        assert_eq!(card.style.padding_set, [true; 4]);
+    }
+
+    #[test]
+    fn parses_auto_horizontal_margins_for_centered_containers() {
+        let stylesheet = ".container { margin: 0 auto }";
+        let html =
+            format!("<style>{stylesheet}</style><main><div class='container'>x</div></main>");
+        let dom = parse_document(RcDom::default(), Default::default()).one(html);
+        let tree = render_tree(&dom.document, &[stylesheet.into()], None);
+        let container = find(&tree, "div");
+
+        assert_eq!(container.style.margin, [0.0; 4]);
+        assert_eq!(container.style.margin_auto, [false, true, false, true]);
     }
 }

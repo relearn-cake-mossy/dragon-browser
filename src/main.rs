@@ -362,20 +362,23 @@ fn render_node(
         return;
     }
 
-    let spacing = if node.style.margin != [0.0; 4] {
-        node.style.margin
-    } else {
-        let vertical = match tag {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => 12.0,
-            "p" | "blockquote" | "pre" | "ul" | "ol" | "table" | "figure" => 10.0,
-            _ => 0.0,
-        };
-        [vertical, 0.0, vertical, 0.0]
+    let vertical = match tag {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => 12.0,
+        "p" | "blockquote" | "pre" | "ul" | "ol" | "table" | "figure" => 10.0,
+        _ => 0.0,
     };
+    let default_spacing = [vertical, 0.0, vertical, 0.0];
+    let spacing: [f32; 4] = std::array::from_fn(|side| {
+        if node.style.margin_set[side] {
+            node.style.margin[side]
+        } else {
+            default_spacing[side]
+        }
+    });
     ui.add_space(spacing[0].max(0.0));
     let mut draw_contents = |ui: &mut egui::Ui| {
         if display == Some(dragon_core::DisplayMode::Flex) {
-            ui.horizontal_wrapped(|ui| render_flex_children(ui, node, images, clicked_link));
+            render_flex_children(ui, node, images, clicked_link);
         } else if tag == "li" {
             ui.horizontal_wrapped(|ui| {
                 ui.label("• ");
@@ -427,14 +430,17 @@ fn render_node(
     };
     let available = ui.available_width().max(1.0);
     let width = content_width(available, node.style.width, node.style.max_width);
-    let auto_center = node.style.width.is_some() || node.style.max_width.is_some();
+    let horizontal_space = (available - width).max(0.0);
     let left = spacing[3].max(0.0)
-        + if auto_center {
-            (available - width).max(0.0) / 2.0
+        + if node.style.margin_auto[1] && node.style.margin_auto[3] {
+            horizontal_space / 2.0
+        } else if node.style.margin_auto[3] {
+            horizontal_space
         } else {
             0.0
         };
-    if left > 0.0 || spacing[1] > 0.0 || auto_center {
+    let constrained_width = node.style.width.is_some() || node.style.max_width.is_some();
+    if left > 0.0 || spacing[1] > 0.0 || constrained_width {
         ui.horizontal(|ui| {
             ui.add_space(left);
             ui.allocate_ui_with_layout(
@@ -469,9 +475,90 @@ fn render_flex_children(
     images: &HashMap<String, egui::TextureHandle>,
     clicked_link: &mut Option<String>,
 ) {
-    for child in &node.children {
-        render_node(ui, child, images, clicked_link);
+    let children = node
+        .children
+        .iter()
+        .filter(|child| child.tag.is_some() || !child.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if children.is_empty() {
+        return;
     }
+
+    let direction = node
+        .style
+        .flex_direction
+        .unwrap_or(dragon_core::FlexDirection::Row);
+    let available = ui.available_width().max(1.0);
+    let gap_value = if matches!(
+        direction,
+        dragon_core::FlexDirection::Column | dragon_core::FlexDirection::ColumnReverse
+    ) {
+        node.style.row_gap
+    } else {
+        node.style.column_gap
+    };
+    let gap = gap_value.map_or(0.0, |value| {
+        if value < 0.0 {
+            available * (-value / 100.0).clamp(0.0, 1.0)
+        } else {
+            value
+        }
+    });
+    let reverse = matches!(
+        direction,
+        dragon_core::FlexDirection::RowReverse | dragon_core::FlexDirection::ColumnReverse
+    );
+    if matches!(
+        direction,
+        dragon_core::FlexDirection::Column | dragon_core::FlexDirection::ColumnReverse
+    ) {
+        let ordered = if reverse {
+            children.into_iter().rev().collect::<Vec<_>>()
+        } else {
+            children
+        };
+        for (index, child) in ordered.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(gap);
+            }
+            render_node(ui, child, images, clicked_link);
+        }
+        return;
+    }
+
+    let children = if reverse {
+        children.into_iter().rev().collect::<Vec<_>>()
+    } else {
+        children
+    };
+    let block_count = children.iter().filter(|child| is_block_node(child)).count();
+    let item_width = if block_count > 0 {
+        ((available - gap * block_count.saturating_sub(1) as f32) / block_count as f32).max(1.0)
+    } else {
+        available
+    };
+    ui.horizontal_wrapped(|ui| {
+        let mut block_index = 0;
+        let mut previous_was_block = false;
+        for child in children {
+            let is_block = is_block_node(child);
+            if is_block && previous_was_block {
+                ui.add_space(gap);
+            }
+            if is_block {
+                let width = content_width(item_width, child.style.width, child.style.max_width);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width.min(ui.available_width()).max(1.0), 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| render_node(ui, child, images, clicked_link),
+                );
+                block_index += 1;
+            } else {
+                render_node(ui, child, images, clicked_link);
+            }
+            previous_was_block = is_block && block_index < block_count;
+        }
+    });
 }
 
 fn render_flow_children(

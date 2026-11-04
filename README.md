@@ -25,10 +25,11 @@ cargo run --release --features headless --bin dragon-browser-headless -- https:/
 ```
 
 Renderer hỗ trợ luồng block/inline, selector CSS tag/class/id và selector con/
-hậu duệ, màu/chữ, display cơ bản (block/inline/flex), width/max-width theo px/%
-và margin/padding px. Chưa có layout CSS đầy đủ (flex-wrap/grow, grid, position),
+hậu duệ, màu/chữ, display cơ bản (block/inline/flex), flex row/column với gap,
+width/max-width theo px/% và margin/padding px. Chưa có layout CSS đầy đủ
+(flex-grow/shrink, grid, position),
 bảng hoàn chỉnh, SVG hay video. Ứng dụng tải stylesheet ngoài và tối đa 8 ảnh
-(kể cả `data-src` phổ biến). Boa chạy tối đa 32 script JavaScript cổ điển inline/
+(kể cả `data-src` phổ biến). Boa chạy tối đa 64 script JavaScript cổ điển inline/
 ngoài theo thứ tự tài liệu; script ngoài tối đa 512 KiB mỗi file.
 `document.write/writeln` có thể thêm HTML đơn giản. JavaScript có DOM giả lập ở
 mức cơ bản: selector descendant/child, `classList`, thuộc tính DOM, clone node,

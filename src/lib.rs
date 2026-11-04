@@ -1,5 +1,5 @@
 mod css;
-pub use css::{DisplayMode, RenderNode, StyledBlock, TextAlignment, TextStyle};
+pub use css::{DisplayMode, FlexDirection, RenderNode, StyledBlock, TextAlignment, TextStyle};
 
 use std::io::Read;
 use std::time::Duration;
@@ -14,7 +14,7 @@ const MAX_STYLESHEETS: usize = 8;
 const MAX_STYLESHEET_BYTES: u64 = 512 * 1024;
 const MAX_IMAGES: usize = 8;
 const MAX_IMAGE_BYTES: u64 = 1024 * 1024;
-const MAX_SCRIPTS: usize = 32;
+const MAX_SCRIPTS: usize = 64;
 const MAX_INLINE_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_EXTERNAL_SCRIPT_BYTES: u64 = 512 * 1024;
 const MAX_SCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -377,6 +377,10 @@ fn execute_scripts(
                     else if (String(value) !== "") this.appendChild(document.createTextNode(String(value)));
                 }}
             }});
+            Object.defineProperty(node, "innerText", {{
+                get: function() {{ return this.textContent; }},
+                set: function(value) {{ this.textContent = value; }}
+            }});
             Object.defineProperty(node, "innerHTML", {{
                 get: function() {{ return this.childNodes.map(__dragonSerialize).join(""); }},
                 set: function(value) {{
@@ -424,6 +428,34 @@ fn execute_scripts(
             }});
             Object.defineProperty(node, "childElementCount", {{
                 get: function() {{ return this.children.length; }}
+            }});
+            Object.defineProperty(node, "nextSibling", {{
+                get: function() {{
+                    if (!this.parentNode) return null;
+                    var index = this.parentNode.childNodes.indexOf(this);
+                    return this.parentNode.childNodes[index + 1] || null;
+                }}
+            }});
+            Object.defineProperty(node, "previousSibling", {{
+                get: function() {{
+                    if (!this.parentNode) return null;
+                    var index = this.parentNode.childNodes.indexOf(this);
+                    return index > 0 ? this.parentNode.childNodes[index - 1] : null;
+                }}
+            }});
+            Object.defineProperty(node, "nextElementSibling", {{
+                get: function() {{
+                    var sibling = this.nextSibling;
+                    while (sibling && sibling.nodeType !== 1) sibling = sibling.nextSibling;
+                    return sibling;
+                }}
+            }});
+            Object.defineProperty(node, "previousElementSibling", {{
+                get: function() {{
+                    var sibling = this.previousSibling;
+                    while (sibling && sibling.nodeType !== 1) sibling = sibling.previousSibling;
+                    return sibling;
+                }}
             }});
             Object.defineProperty(node, "style", {{
                 get: function() {{
@@ -517,6 +549,7 @@ fn execute_scripts(
                 }}
             }};
             node.appendChild = function(child) {{
+                if (child === this || (child.contains && child.contains(this))) throw new Error("Cannot insert a node into its descendant");
                 if (child.parentNode) child.parentNode.removeChild(child);
                 child.parentNode = this;
                 this.childNodes.push(child);
@@ -526,7 +559,12 @@ fn execute_scripts(
                 if (!reference) return this.appendChild(child);
                 var index = this.childNodes.indexOf(reference);
                 if (index < 0) throw new Error("Reference node is not a child");
-                if (child.parentNode) child.parentNode.removeChild(child);
+                if (child === reference) return child;
+                if (child === this || (child.contains && child.contains(this))) throw new Error("Cannot insert a node into its descendant");
+                var previousParent = child.parentNode;
+                var previousIndex = previousParent === this ? this.childNodes.indexOf(child) : -1;
+                if (previousParent) previousParent.removeChild(child);
+                if (previousParent === this && previousIndex < index) index--;
                 child.parentNode = this;
                 this.childNodes.splice(index, 0, child);
                 return child;
@@ -537,6 +575,9 @@ fn execute_scripts(
                 this.childNodes.splice(index, 1);
                 child.parentNode = null;
                 return child;
+            }};
+            node.remove = function() {{
+                if (this.parentNode) this.parentNode.removeChild(this);
             }};
             node.querySelectorAll = function(selector) {{ return __dragonQuery(this, selector, false); }};
             node.querySelector = function(selector) {{ return __dragonQuery(this, selector, true)[0] || null; }};
@@ -1268,6 +1309,28 @@ mod tests {
     }
 
     #[test]
+    fn moves_nodes_before_references_and_removes_detached_nodes() {
+        let mut warnings = Vec::new();
+        let html = execute_inline_scripts(
+            "<body><main><p id='first'>First</p><p id='second'>Second</p><p id='remove'>Remove</p></main>\
+             <script>\
+             var first = document.getElementById('first');\
+             var second = document.getElementById('second');\
+             if (first.previousElementSibling !== null) throw new Error('unexpected previous sibling');\
+             first.parentNode.insertBefore(second, first);\
+             if (first.previousElementSibling !== second) throw new Error('node order is wrong');\
+             document.getElementById('remove').remove();\
+             </script></body>",
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let page = parse_html(&html);
+        assert!(page.text.find("Second").unwrap() < page.text.find("First").unwrap());
+        assert!(!page.text.contains("Remove"));
+    }
+
+    #[test]
     fn exposes_document_head_and_element_style_mutation() {
         let mut warnings = Vec::new();
         let html = execute_inline_scripts(
@@ -1285,18 +1348,18 @@ mod tests {
     }
 
     #[test]
-    fn executes_at_most_32_scripts() {
-        let scripts = (0..33)
+    fn executes_at_most_64_scripts() {
+        let scripts = (0..65)
             .map(|index| format!("<script>document.write('{index},')</script>"))
             .collect::<String>();
         let mut warnings = Vec::new();
         let html = execute_inline_scripts(&format!("<body>{scripts}</body>"), &mut warnings);
 
         let rendered = parse_html(&html).text;
-        assert!(rendered.ends_with("31,"));
-        assert!(!rendered.ends_with("32,"));
+        assert!(rendered.ends_with("63,"));
+        assert!(!rendered.ends_with("64,"));
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("32"));
+        assert!(warnings[0].contains("64"));
     }
 
     #[test]
