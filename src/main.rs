@@ -25,6 +25,7 @@ struct BrowserTab {
     address: String,
     page: Option<Article>,
     page_images: HashMap<String, egui::TextureHandle>,
+    form_values: HashMap<String, String>,
     error: Option<String>,
     loading: bool,
     request_id: u64,
@@ -37,6 +38,7 @@ impl BrowserTab {
             address,
             page: None,
             page_images: HashMap::new(),
+            form_values: HashMap::new(),
             error: None,
             loading: false,
             request_id: 0,
@@ -107,6 +109,7 @@ impl DragonBrowserApp {
         tab.address = address.clone();
         tab.page = None;
         tab.page_images.clear();
+        tab.form_values.clear();
         tab.error = None;
         tab.loading = true;
         let tab_id = tab.id;
@@ -155,6 +158,7 @@ impl DragonBrowserApp {
                         }
                     }
                     tab.page = Some(article);
+                    tab.form_values.clear();
                 }
                 Err(error) => tab.error = Some(error),
             }
@@ -174,6 +178,7 @@ impl DragonBrowserApp {
             tab.address.clear();
             tab.page = None;
             tab.page_images.clear();
+            tab.form_values.clear();
             tab.error = None;
             tab.loading = false;
             tab.request_id = 0;
@@ -294,7 +299,7 @@ impl eframe::App for DragonBrowserApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add_space(20.0);
-                    if let Some(tab) = self.active_tab() {
+                    if let Some(tab) = self.active_tab_mut() {
                         if let Some(error) = &tab.error {
                             ui.heading("Không thể mở trang");
                             ui.label(error);
@@ -309,6 +314,7 @@ impl eframe::App for DragonBrowserApp {
                                 &article.render_tree,
                                 &tab.page_images,
                                 &mut clicked_link,
+                                &mut tab.form_values,
                             );
                         } else if tab.loading {
                             ui.spinner();
@@ -343,9 +349,10 @@ fn render_node(
     node: &RenderNode,
     images: &HashMap<String, egui::TextureHandle>,
     clicked_link: &mut Option<String>,
+    form_values: &mut HashMap<String, String>,
 ) {
     if node.tag.is_none() {
-        render_inline(ui, node, images, clicked_link);
+        render_inline(ui, node, images, clicked_link, form_values);
         return;
     }
 
@@ -354,11 +361,14 @@ fn render_node(
         render_image(ui, node, images, clicked_link);
         return;
     }
+    if render_form_control(ui, node, form_values) {
+        return;
+    }
     let display = node.style.display;
     if display == Some(dragon_core::DisplayMode::Inline)
         || (display.is_none() && !is_block_element(tag))
     {
-        render_inline(ui, node, images, clicked_link);
+        render_inline(ui, node, images, clicked_link, form_values);
         return;
     }
 
@@ -378,14 +388,14 @@ fn render_node(
     ui.add_space(spacing[0].max(0.0));
     let mut draw_contents = |ui: &mut egui::Ui| {
         if display == Some(dragon_core::DisplayMode::Flex) {
-            render_flex_children(ui, node, images, clicked_link);
+            render_flex_children(ui, node, images, clicked_link, form_values);
         } else if tag == "li" {
             ui.horizontal_wrapped(|ui| {
                 ui.label("• ");
-                render_flow_children(ui, node, images, clicked_link);
+                render_flow_children(ui, node, images, clicked_link, form_values);
             });
         } else {
-            render_flow_children(ui, node, images, clicked_link);
+            render_flow_children(ui, node, images, clicked_link, form_values);
         }
     };
     let mut draw_aligned = |ui: &mut egui::Ui| {
@@ -474,6 +484,7 @@ fn render_flex_children(
     node: &RenderNode,
     images: &HashMap<String, egui::TextureHandle>,
     clicked_link: &mut Option<String>,
+    form_values: &mut HashMap<String, String>,
 ) {
     let children = node
         .children
@@ -521,7 +532,7 @@ fn render_flex_children(
             if index > 0 {
                 ui.add_space(gap);
             }
-            render_node(ui, child, images, clicked_link);
+            render_node(ui, child, images, clicked_link, form_values);
         }
         return;
     }
@@ -550,11 +561,11 @@ fn render_flex_children(
                 ui.allocate_ui_with_layout(
                     egui::vec2(width.min(ui.available_width()).max(1.0), 0.0),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| render_node(ui, child, images, clicked_link),
+                    |ui| render_node(ui, child, images, clicked_link, form_values),
                 );
                 block_index += 1;
             } else {
-                render_node(ui, child, images, clicked_link);
+                render_node(ui, child, images, clicked_link, form_values);
             }
             previous_was_block = is_block && block_index < block_count;
         }
@@ -566,11 +577,12 @@ fn render_flow_children(
     node: &RenderNode,
     images: &HashMap<String, egui::TextureHandle>,
     clicked_link: &mut Option<String>,
+    form_values: &mut HashMap<String, String>,
 ) {
     let mut index = 0;
     while index < node.children.len() {
         if is_block_node(&node.children[index]) {
-            render_node(ui, &node.children[index], images, clicked_link);
+            render_node(ui, &node.children[index], images, clicked_link, form_values);
             index += 1;
             continue;
         }
@@ -581,7 +593,7 @@ fn render_flow_children(
         }
         ui.horizontal_wrapped(|ui| {
             for child in &node.children[start..index] {
-                render_inline(ui, child, images, clicked_link);
+                render_inline(ui, child, images, clicked_link, form_values);
             }
         });
     }
@@ -592,6 +604,7 @@ fn render_inline(
     node: &RenderNode,
     images: &HashMap<String, egui::TextureHandle>,
     clicked_link: &mut Option<String>,
+    form_values: &mut HashMap<String, String>,
 ) {
     if node.image_url.is_some() {
         render_image(ui, node, images, clicked_link);
@@ -609,6 +622,9 @@ fn render_inline(
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.clicked() {
                 *clicked_link = Some(href.clone());
+            }
+            if render_form_control(ui, node, form_values) {
+                return;
             }
         }
         return;
@@ -642,11 +658,176 @@ fn render_inline(
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(red, green, blue))
             .show(ui, |ui| {
-                render_inline_children(ui, node, images, clicked_link);
+                render_inline_children(ui, node, images, clicked_link, form_values);
             });
     } else {
-        render_inline_children(ui, node, images, clicked_link);
+        render_inline_children(ui, node, images, clicked_link, form_values);
     }
+}
+
+fn render_form_control(
+    ui: &mut egui::Ui,
+    node: &RenderNode,
+    form_values: &mut HashMap<String, String>,
+) -> bool {
+    let Some(tag) = node.tag.as_deref() else {
+        return false;
+    };
+    match tag {
+        "input" => {
+            let input_type = node
+                .attributes
+                .get("type")
+                .map(String::as_str)
+                .unwrap_or("text")
+                .to_ascii_lowercase();
+            if input_type == "hidden" {
+                return true;
+            }
+            let key = node.key.to_string();
+            let disabled = node.attributes.contains_key("disabled");
+            let value = node.attributes.get("value").cloned().unwrap_or_default();
+            ui.push_id(node.key, |ui| match input_type.as_str() {
+                "checkbox" => {
+                    let checked = node.attributes.contains_key("checked");
+                    let selected = form_values
+                        .entry(key)
+                        .or_insert_with(|| if checked { "true" } else { "false" }.to_owned());
+                    let mut checked = selected == "true";
+                    if ui
+                        .add_enabled(
+                            !disabled,
+                            egui::Checkbox::new(
+                                &mut checked,
+                                node.attributes
+                                    .get("aria-label")
+                                    .map(String::as_str)
+                                    .unwrap_or(""),
+                            ),
+                        )
+                        .changed()
+                    {
+                        *selected = checked.to_string();
+                    }
+                }
+                "radio" => {
+                    let name = node.attributes.get("name").cloned().unwrap_or_default();
+                    let radio_key = format!("radio:{name}");
+                    let radio_value = value.clone();
+                    let selected = form_values.entry(radio_key).or_insert_with(|| {
+                        if node.attributes.contains_key("checked") {
+                            radio_value.clone()
+                        } else {
+                            String::new()
+                        }
+                    });
+                    ui.add_enabled(!disabled, egui::RadioButton::new(selected == &value, ""))
+                        .clicked()
+                        .then(|| *selected = value);
+                }
+                "button" | "submit" | "reset" | "image" => {
+                    let label = node
+                        .attributes
+                        .get("value")
+                        .map(String::as_str)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(input_type.as_str());
+                    let _ = ui.add_enabled(!disabled, egui::Button::new(label));
+                }
+                "file" => {
+                    let _ = ui.add_enabled(!disabled, egui::Button::new("Chọn tệp"));
+                }
+                _ => {
+                    let value = form_values.entry(key).or_insert(value);
+                    let mut editor = egui::TextEdit::singleline(value)
+                        .desired_width(ui.available_width().min(360.0).max(80.0))
+                        .interactive(!disabled && !node.attributes.contains_key("readonly"));
+                    if input_type == "password" {
+                        editor = editor.password(true);
+                    }
+                    if let Some(placeholder) = node.attributes.get("placeholder") {
+                        editor = editor.hint_text(placeholder);
+                    }
+                    ui.add(editor);
+                }
+            });
+            true
+        }
+        "textarea" => {
+            let key = node.key.to_string();
+            let initial = render_node_text(node);
+            let value = form_values.entry(key).or_insert(initial);
+            let mut editor = egui::TextEdit::multiline(value)
+                .desired_width(ui.available_width().max(80.0))
+                .desired_rows(4)
+                .interactive(
+                    !node.attributes.contains_key("disabled")
+                        && !node.attributes.contains_key("readonly"),
+                );
+            if let Some(placeholder) = node.attributes.get("placeholder") {
+                editor = editor.hint_text(placeholder);
+            }
+            ui.add(editor);
+            true
+        }
+        "select" => {
+            let options = node
+                .children
+                .iter()
+                .filter(|child| child.tag.as_deref() == Some("option"))
+                .map(|option| {
+                    let label = render_node_text(option).trim().to_owned();
+                    let value = option
+                        .attributes
+                        .get("value")
+                        .cloned()
+                        .unwrap_or_else(|| label.clone());
+                    (value, label, option.attributes.contains_key("selected"))
+                })
+                .collect::<Vec<_>>();
+            if options.is_empty() {
+                ui.label("Chọn...");
+                return true;
+            }
+            let initial = options
+                .iter()
+                .find(|(_, _, selected)| *selected)
+                .or_else(|| options.first())
+                .map(|(value, _, _)| value.clone())
+                .unwrap_or_default();
+            let selected = form_values.entry(node.key.to_string()).or_insert(initial);
+            let selected_label = options
+                .iter()
+                .find(|(value, _, _)| value == selected)
+                .map(|(_, label, _)| label.as_str())
+                .unwrap_or("Chọn...");
+            egui::ComboBox::from_id_salt(node.key)
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    for (value, label, _) in options {
+                        ui.selectable_value(selected, value, label);
+                    }
+                });
+            true
+        }
+        "button" => {
+            let label = render_node_text(node);
+            let _ = ui.add_enabled(
+                !node.attributes.contains_key("disabled"),
+                egui::Button::new(label),
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn render_node_text(node: &RenderNode) -> String {
+    let mut text = node.text.clone();
+    for child in &node.children {
+        text.push_str(&render_node_text(child));
+    }
+    text
 }
 
 fn render_inline_children(
@@ -654,9 +835,10 @@ fn render_inline_children(
     node: &RenderNode,
     images: &HashMap<String, egui::TextureHandle>,
     clicked_link: &mut Option<String>,
+    form_values: &mut HashMap<String, String>,
 ) {
     for child in &node.children {
-        render_inline(ui, child, images, clicked_link);
+        render_inline(ui, child, images, clicked_link, form_values);
     }
 }
 
@@ -780,13 +962,63 @@ fn decode_page_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
-    let (width, height) = reader
-        .into_dimensions()
+    match reader.into_dimensions() {
+        Ok((width, height)) => {
+            validate_image_dimensions(width, height)?;
+            image::load_from_memory(bytes).map_err(|error| error.to_string())
+        }
+        Err(_) if looks_like_svg(bytes) => rasterize_svg(bytes),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn rasterize_svg(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default())
         .map_err(|error| error.to_string())?;
-    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS || width > 4096 || height > 4096 {
+    let size = tree.size();
+    if !size.width().is_finite()
+        || !size.height().is_finite()
+        || size.width() <= 0.0
+        || size.height() <= 0.0
+        || size.width() > 4096.0
+        || size.height() > 4096.0
+    {
         return Err("kích thước ảnh vượt giới hạn giải mã".into());
     }
-    image::load_from_memory(bytes).map_err(|error| error.to_string())
+    let width = size.width().round() as u32;
+    let height = size.height().round() as u32;
+    validate_image_dimensions(width, height)?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| "không thể cấp phát bộ nhớ cho ảnh SVG".to_owned())?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
+    image::RgbaImage::from_raw(width, height, pixmap.take())
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or_else(|| "không thể chuyển đổi ảnh SVG".to_owned())
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    let prefix = text.get(..text.len().min(512)).unwrap_or(text);
+    prefix.starts_with("<svg") || (prefix.starts_with("<?xml") && prefix.contains("<svg"))
+}
+
+fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+        || width > 4096
+        || height > 4096
+    {
+        return Err("kích thước ảnh vượt giới hạn giải mã".into());
+    }
+    Ok(())
 }
 
 fn normalize_address(address: &str) -> String {
@@ -841,7 +1073,93 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_address, resolve_link, truncate_tab_title};
+    use eframe::egui;
+    use image::GenericImageView;
+
+    use std::collections::HashMap;
+
+    use super::{
+        decode_page_image, normalize_address, render_form_control, resolve_link,
+        truncate_tab_title, RenderNode,
+    };
+
+    #[test]
+    fn decodes_bounded_svg_images() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2">
+            <rect width="2" height="2" fill="#ff0000"/>
+        </svg>"##;
+        let image = decode_page_image(svg).unwrap();
+
+        assert_eq!(image.dimensions(), (2, 2));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rejects_oversized_svg_images() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4097" height="4097"/>"#;
+
+        assert!(decode_page_image(svg)
+            .unwrap_err()
+            .contains("vượt giới hạn"));
+    }
+
+    #[test]
+    fn initializes_page_form_controls_from_html() {
+        fn find<'a>(node: &'a RenderNode, id: &str) -> &'a RenderNode {
+            if node.attributes.get("id").map(String::as_str) == Some(id) {
+                return node;
+            }
+            node.children
+                .iter()
+                .find_map(|child| find_optional(child, id))
+                .expect("form control should exist")
+        }
+
+        fn find_optional<'a>(node: &'a RenderNode, id: &str) -> Option<&'a RenderNode> {
+            if node.attributes.get("id").map(String::as_str) == Some(id) {
+                return Some(node);
+            }
+            node.children
+                .iter()
+                .find_map(|child| find_optional(child, id))
+        }
+
+        let article = dragon_core::parse_html(
+            "<body><input id='query' value='news' placeholder='Search'>\
+             <textarea id='message'>hello</textarea>\
+             <input id='enabled' type='checkbox' checked>\
+             <select id='category'><option value='world'>World</option>\
+             <option value='local' selected>Local</option></select></body>",
+        );
+        let controls =
+            ["query", "message", "enabled", "category"].map(|id| find(&article.render_tree, id));
+        let mut values = HashMap::new();
+        let context = egui::Context::default();
+        let _ = context.run(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                for control in controls {
+                    assert!(render_form_control(ui, control, &mut values));
+                }
+            });
+        });
+
+        assert_eq!(
+            values.get(&find(&article.render_tree, "query").key.to_string()),
+            Some(&"news".to_owned())
+        );
+        assert_eq!(
+            values.get(&find(&article.render_tree, "message").key.to_string()),
+            Some(&"hello".to_owned())
+        );
+        assert_eq!(
+            values.get(&find(&article.render_tree, "enabled").key.to_string()),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(
+            values.get(&find(&article.render_tree, "category").key.to_string()),
+            Some(&"local".to_owned())
+        );
+    }
 
     #[test]
     fn adds_https_to_bare_addresses() {

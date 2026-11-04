@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use markup5ever_rcdom::{Handle, NodeData};
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -58,9 +60,11 @@ pub struct StyledBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderNode {
+    pub key: u64,
     pub tag: Option<String>,
     pub text: String,
     pub href: Option<String>,
+    pub attributes: BTreeMap<String, String>,
     pub style: TextStyle,
     pub image_url: Option<String>,
     pub image_alt: String,
@@ -185,7 +189,8 @@ pub fn render_tree(
     base_url: Option<&url::Url>,
 ) -> RenderNode {
     let rules = parse_rules(stylesheets);
-    build_render_node(root, &TextStyle::default(), &rules, base_url)
+    let mut next_key = 0;
+    build_render_node(root, &TextStyle::default(), &rules, base_url, &mut next_key)
 }
 
 fn build_render_node(
@@ -193,12 +198,17 @@ fn build_render_node(
     inherited: &TextStyle,
     rules: &[Rule],
     base_url: Option<&url::Url>,
+    next_key: &mut u64,
 ) -> RenderNode {
+    let key = *next_key;
+    *next_key += 1;
     match &node.data {
         NodeData::Text { contents } => RenderNode {
+            key,
             tag: None,
             text: contents.borrow().to_string(),
             href: None,
+            attributes: BTreeMap::new(),
             style: inherited.clone(),
             image_url: None,
             image_alt: String::new(),
@@ -215,13 +225,27 @@ fn build_render_node(
                 node.children
                     .borrow()
                     .iter()
-                    .map(|child| build_render_node(child, &style, rules, base_url))
+                    .map(|child| build_render_node(child, &style, rules, base_url, next_key))
                     .collect()
             };
             RenderNode {
+                key,
                 tag: (!hidden).then(|| tag.to_owned()),
                 text: String::new(),
                 href: (tag == "a").then(|| attribute(node, "href")).flatten(),
+                attributes: match &node.data {
+                    NodeData::Element { attrs, .. } => attrs
+                        .borrow()
+                        .iter()
+                        .map(|attribute| {
+                            (
+                                attribute.name.local.to_string(),
+                                attribute.value.to_string(),
+                            )
+                        })
+                        .collect(),
+                    _ => BTreeMap::new(),
+                },
                 style,
                 image_url: (tag == "img")
                     .then(|| image_source(node, base_url))
@@ -231,9 +255,11 @@ fn build_render_node(
             }
         }
         _ => RenderNode {
+            key,
             tag: None,
             text: String::new(),
             href: None,
+            attributes: BTreeMap::new(),
             style: inherited.clone(),
             image_url: None,
             image_alt: String::new(),
@@ -241,7 +267,7 @@ fn build_render_node(
                 .children
                 .borrow()
                 .iter()
-                .map(|child| build_render_node(child, inherited, rules, base_url))
+                .map(|child| build_render_node(child, inherited, rules, base_url, next_key))
                 .collect(),
         },
     }

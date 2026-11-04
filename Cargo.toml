@@ -33,6 +33,7 @@ eframe = { version = "0.31.1", default-features = false, features = ["default_fo
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 thiserror = "2"
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip", "brotli"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+resvg = { version = "0.45.1", default-features = false, features = ["text"] }
 url = "2.5"

@@ -271,6 +271,12 @@ fn load_scripts(
                     ));
                     continue;
                 };
+                if is_ad_script_url(&script_url) {
+                    warnings.push(format!(
+                        "Đã bỏ qua script quảng cáo chưa được hỗ trợ: {script_url}"
+                    ));
+                    continue;
+                }
                 match fetch_bytes(agent, &script_url, MAX_EXTERNAL_SCRIPT_BYTES) {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                     Err(error) => {
@@ -288,6 +294,19 @@ fn load_scripts(
         ));
     }
     scripts
+}
+
+fn is_ad_script_url(source: &str) -> bool {
+    let Ok(url) = url::Url::parse(source) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let path = url.path().to_ascii_lowercase();
+    (host == "doubleclick.net" || host.ends_with(".doubleclick.net"))
+        || (host == "googlesyndication.com" || host.ends_with(".googlesyndication.com"))
+        || (host == "scdn.eclick.vn"
+            && (path.contains("/delivery/dfp/") || path.ends_with("/delivery/eclick.js")))
+        || path.ends_with("/adp_banner.js")
 }
 
 fn resolve_script_url(base_url: &url::Url, source: &str) -> Option<String> {
@@ -664,6 +683,20 @@ fn execute_scripts(
             removeEventListener: function() {{}},
             dispatchEvent: function() {{ return true; }}
         }};
+        Object.defineProperty(document, "cookie", {{
+            get: function() {{ return ""; }},
+            set: function() {{}}
+        }});
+        document.hidden = false;
+        document.visibilityState = "visible";
+        document.createEvent = function() {{
+            return {{
+                type: "",
+                initEvent: function(type) {{ this.type = String(type); }},
+                preventDefault: function() {{}},
+                stopPropagation: function() {{}}
+            }};
+        }};
         document._root = __dragonCreate(globalThis.__dragonRoot, null);
         document.documentElement = document.querySelector("html");
         document.head = document.querySelector("head");
@@ -671,6 +704,41 @@ fn execute_scripts(
         globalThis.document = document;
         globalThis.window = globalThis;
         globalThis.self = globalThis;
+        globalThis.top = globalThis;
+        globalThis.parent = globalThis;
+        function __dragonStorage() {{
+            var values = Object.create(null);
+            return {{
+                get length() {{ return Object.keys(values).length; }},
+                key: function(index) {{ return Object.keys(values)[Number(index)] || null; }},
+                getItem: function(key) {{
+                    key = String(key);
+                    return Object.prototype.hasOwnProperty.call(values, key) ? values[key] : null;
+                }},
+                setItem: function(key, value) {{ values[String(key)] = String(value); }},
+                removeItem: function(key) {{ delete values[String(key)]; }},
+                clear: function() {{ values = Object.create(null); }}
+            }};
+        }}
+        globalThis.localStorage = __dragonStorage();
+        globalThis.sessionStorage = __dragonStorage();
+        globalThis.matchMedia = function(query) {{
+            return {{
+                matches: false,
+                media: String(query),
+                onchange: null,
+                addListener: function() {{}},
+                removeListener: function() {{}},
+                addEventListener: function() {{}},
+                removeEventListener: function() {{}},
+                dispatchEvent: function() {{ return true; }}
+            }};
+        }};
+        globalThis.getComputedStyle = function(element) {{
+            return element && element.style ? element.style : {{
+                getPropertyValue: function() {{ return ""; }}
+            }};
+        }};
         globalThis.navigator = {{
             userAgent: "DragonBrowser/0.0.2",
             appName: "DragonBrowser",
@@ -1019,7 +1087,7 @@ mod tests {
     use std::thread;
 
     use super::load_url;
-    use super::{execute_inline_scripts, execute_javascript, parse_html};
+    use super::{execute_inline_scripts, execute_javascript, is_ad_script_url, parse_html};
 
     #[test]
     fn renders_body_content_and_omits_scripts() {
@@ -1103,7 +1171,21 @@ mod tests {
     }
 
     #[test]
-    fn loads_external_scripts_and_inserts_document_write_output() {
+    fn skips_known_ad_network_scripts_but_keeps_site_scripts() {
+        assert!(is_ad_script_url(
+            "https://scdn.eclick.vn/delivery/dfp/prebid.js"
+        ));
+        assert!(is_ad_script_url(
+            "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
+        ));
+        assert!(!is_ad_script_url("https://notdoubleclick.net/script.js"));
+        assert!(!is_ad_script_url(
+            "https://s1cdn.vnecdn.net/vnexpress/restruct/site.js"
+        ));
+    }
+
+    #[test]
+    fn loads_gzip_compressed_external_scripts() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
 
@@ -1121,23 +1203,33 @@ mod tests {
                     }
                 }
                 drop(reader);
-                let (content_type, body): (&str, &[u8]) = if request_line.contains("/page.html") {
-                    (
-                        "text/html",
-                        b"<html><body><script src='/app.js'></script>\
+                let (content_type, body, encoding): (&str, &[u8], Option<&str>) =
+                    if request_line.contains("/page.html") {
+                        (
+                            "text/html",
+                            b"<html><body><script src='/app.js'></script>\
                               <script>document.write('<p>Inline script</p>')</script>\
                               </body></html>",
-                    )
-                } else {
-                    (
-                        "application/javascript",
-                        b"document.write('<p>External script</p>')",
-                    )
-                };
+                            None,
+                        )
+                    } else {
+                        (
+                            "application/javascript",
+                            &[
+                                0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x4b,
+                                0xc9, 0x4f, 0x2e, 0xcd, 0x4d, 0xcd, 0x2b, 0xd1, 0x2b, 0x2f, 0xca,
+                                0x2c, 0x49, 0xd5, 0x50, 0xb7, 0x29, 0xb0, 0x4b, 0xaf, 0xca, 0x2c,
+                                0x50, 0x28, 0xcf, 0x2f, 0xca, 0x2e, 0xb6, 0xd1, 0x2f, 0xb0, 0x53,
+                                0xd7, 0x04, 0x00, 0x90, 0x47, 0x3d, 0x90, 0x23, 0x00, 0x00, 0x00,
+                            ][..],
+                            Some("gzip"),
+                        )
+                    };
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+                    body.len(),
+                    encoding.map_or(String::new(), |encoding| format!("Content-Encoding: {encoding}\r\n"))
                 )
                 .unwrap();
                 stream.write_all(body).unwrap();
@@ -1150,12 +1242,48 @@ mod tests {
         assert!(article
             .blocks
             .iter()
-            .any(|block| block.text == "External script"));
+            .any(|block| block.text == "gzip works"));
         assert!(article
             .blocks
             .iter()
             .any(|block| block.text == "Inline script"));
         assert!(article.resource_warnings.is_empty());
+    }
+
+    #[test]
+    fn loads_brotli_compressed_documents() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            drop(reader);
+            let body = [
+                0x1f, 0xa6, 0x00, 0xf8, 0x8d, 0x94, 0x6e, 0xde, 0x44, 0x55, 0x86, 0x96, 0x20, 0x6c,
+                0x6f, 0x35, 0x8b, 0x62, 0xb5, 0x40, 0x06, 0x54, 0xbb, 0x02,
+            ];
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: br\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let article = load_url(&format!("http://{address}/page.html")).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(article.text, "hello world ".repeat(14).trim_end());
     }
 
     #[test]
@@ -1282,6 +1410,9 @@ mod tests {
         let html = execute_inline_scripts(
             "<body><script>\
              console.log('test');\
+             localStorage.setItem('test', 42);\
+             if (localStorage.getItem('test') !== '42' || sessionStorage.length !== 0) throw new Error('storage API failed');\
+             if (document.cookie !== '' || matchMedia('(min-width: 700px)').matches) throw new Error('browser API failed');\
              setTimeout(function() { document.write('<p>' + navigator.language + ' ' + location.pathname + '</p>'); }, 0);\
              </script></body>",
             &mut warnings,
